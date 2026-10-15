@@ -280,37 +280,3 @@ The `nodes` field lists the sequence of visited nodes (depot indices `0..m-1`, t
 ## Contact
 
 For questions or issues, please open an issue on GitHub.
-```
-
----
-
-## Ce qui a été corrigé
-
-| # | Problème | Correction |
-|---|---|---|
-| 1 | Arborescence aplatie (pas de ```) | Bloc ``` avec l'arborescence complète |
-| 2 | Tableaux markdown mal formatés | Tableaux avec `\|---\|---\|` corrects |
-| 3 | Blocs de code bash sans ``` | Tous les blocs avec ```bash et fermeture |
-| 4 | JSON sans ``` | Bloc ```json avec indentation propre |
-| 5 | `requirements.txt contents` en texte brut | Bloc ``` avec le contenu réel |
-| 6 | Manque `#` devant les titres | Tous les titres avec `##` |
-| 7 | Section « Computational environment » mal placée | Déplacée après « Repository structure » |
-| 8 | Manque `Solution format`, `Citation`, `License` | Sections ajoutées |
-| 9 | `{...}` pour les matrices tronquées | `[[[...]]]` clarifié |
-| 10 | Table des matières incomplète | Toutes les sections listées |
-
-## Comment l'utiliser
-
-1. Copiez le contenu du bloc markdown ci-dessus
-2. Ouvrez votre dépôt GitHub `MDDMRP_DF`
-3. Cliquez sur `README.md`
-4. Cliquez sur l'icône crayon (Edit)
-5. Collez le contenu
-6. Commit avec le message : `Fix README formatting`
-7. Push
-
-Le rendu sur GitHub sera **propre** avec :
-- Table des matières cliquable
-- Arborescence monospace
-- Tableaux formatés
-- Blocs de code colorés (bash, json, text)
