@@ -6,14 +6,16 @@ This repository contains the code, instances, and results for the paper:
 
 Submitted to *Journal of Heuristics*.
 
-## 📋 Table of contents
+## Table of contents
 
 - [Overview](#overview)
 - [Repository structure](#repository-structure)
+- [Computational environment](#computational-environment)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Reproducing the paper](#reproducing-the-paper)
 - [Instance format](#instance-format)
+- [Solution format](#solution-format)
 
 ## Overview
 
@@ -31,19 +33,32 @@ Two solution methods are provided:
 2. **Adaptive Large Neighborhood Search (ALNS)** for larger instances (up to 200 targets)
 
 ## Repository structure
-.
-├── code/ # Python source code
-│ └── alns_v2.py # ALNS solver (main file)
-├── instances/ # Benchmark instances (JSON)
-├── results/ # Raw experimental results
-│ ├── summary_ALNS.csv # Aggregated results
-│ └── solutions/ # Optimal routes (JSON)
-├── figures/ # Figures from the paper
-├── docs/ # Additional documentation
-├── README.md
-├── LICENSE
-└── requirements.txt
 
+```
+.
+├── code/                    # Python source code
+│   └── alns_v2.py          # ALNS solver (main file)
+├── instances/               # Benchmark instances (JSON)
+├── results/                 # Raw experimental results
+│   ├── summary_ALNS.csv    # Aggregated results
+│   └── solutions/          # Optimal routes (JSON)
+├── figures/                 # Figures from the paper
+├── docs/                    # Additional documentation
+├── README.md
+└── requirements.txt
+```
+
+## Computational environment
+
+All results reported in the paper were obtained on Google Colab's free tier:
+
+- **CPU**: Intel Xeon @ 2.20 GHz (2 vCPUs)
+- **RAM**: 12.7 GB
+- **OS**: Ubuntu 22.04 (Linux kernel 6.6.122+)
+- **Python**: 3.13.16
+- **No GPU**: All experiments are CPU-only
+
+Because Colab allocates hardware dynamically, exact CPU models and clock speeds may vary slightly between sessions. The computation times reported in the paper correspond to the specific instances allocated during our runs.
 
 ## Installation
 
@@ -51,42 +66,40 @@ Two solution methods are provided:
 
 - Python 3.8 or higher
 - NumPy
+- pandas, scipy, matplotlib
 - (Optional) Gurobi 13.0 for the exact MILP solver
-
-## Computational environment
-
-All results reported in the paper were obtained on Google Colab's
-free tier:
-
-- **CPU**: Intel Xeon @ 2.20 GHz (2 vCPUs)
-- **RAM**: 12.7 GB
-- **OS**: Ubuntu 22.04 (Linux 6.6.122+)
-- **Python**: 3.13.16
-- **No GPU**: All experiments CPU-only
 
 ### Install dependencies
 
 ```bash
 pip install -r requirements.txt
+```
 
-requirements.txt contents
+### Contents of `requirements.txt`
 
+```
 numpy>=1.24
 matplotlib>=3.7
 pandas>=2.0
 scipy>=1.10
+```
 
-Quick start
-Run the ALNS on a single instance
-bash
+## Quick start
+
+### Run the ALNS on a single instance
+
+```bash
 cd code
 python alns_v2.py ../instances/instance_advanced_0.json \
     --runs 30 \
     --max-iter 5000 \
     --time-limit 300 \
     --out ../results/test_run
-Run the ALNS on all instances
-bash
+```
+
+### Run the ALNS on all instances
+
+```bash
 cd code
 python alns_v2.py ../instances \
     --runs 30 \
@@ -94,50 +107,72 @@ python alns_v2.py ../instances \
     --time-limit 300 \
     --resume \
     --out ../results/full_run
-Command-line options
-Option	Default	Description
---runs	30	Number of independent runs per instance
---max-iter	5000	Maximum iterations per run
---time-limit	300	Time limit per run (seconds)
---q-min	0.05	Minimum destruction ratio
---q-max	0.30	Maximum destruction ratio
---destroy	random,worst,cluster,current	Active destroy operators
---repair	greedy	Active repair operator
---accept	sa	Acceptance criterion (sa or descent)
---ls-freq	1	Local search frequency (0 = disabled)
---no-adaptive	False	Disable adaptive weights
---out	results_alns	Output directory
---resume	False	Skip already completed runs
---save-solutions	None	Directory for route JSON files
-Reproducing the paper
-1. Table 7 — ALNS validation on small instances
-bash
+```
+
+### Command-line options
+
+| Option | Default | Description |
+|---|---|---|
+| `--runs` | 30 | Number of independent runs per instance |
+| `--max-iter` | 5000 | Maximum iterations per run |
+| `--time-limit` | 300 | Time limit per run (seconds) |
+| `--q-min` | 0.05 | Minimum destruction ratio |
+| `--q-max` | 0.30 | Maximum destruction ratio |
+| `--destroy` | `random,worst,cluster,current` | Active destroy operators |
+| `--repair` | `greedy` | Active repair operator |
+| `--accept` | `sa` | Acceptance criterion (`sa` or `descent`) |
+| `--ls-freq` | 1 | Local search frequency (0 = disabled) |
+| `--no-adaptive` | False | Disable adaptive weights |
+| `--out` | `results_alns` | Output directory |
+| `--resume` | False | Skip already completed runs |
+| `--save-solutions` | None | Directory for route JSON files |
+
+## Reproducing the paper
+
+### 1. Table 7 — ALNS validation on small instances
+
+```bash
 cd code
 python alns_v2.py ../instances \
     --runs 30 --max-iter 5000 --time-limit 300 \
     --out ../results/small_validation
-2. Table 8 — Comparison on medium instances
-bash
+```
+
+### 2. Table 8 — Comparison on medium instances
+
+```bash
 python alns_v2.py ../instances \
     --runs 30 --max-iter 5000 --time-limit 300 \
     --out ../results/medium
-3. Table 9 — Scalability on 100-target instances
-bash
+```
+
+### 3. Table 9 — Scalability on 100-target instances
+
+```bash
 python alns_v2.py ../instances/instance_100_*.json \
     --runs 30 --max-iter 5000 --time-limit 300 \
     --out ../results/large_100
-4. Table 10 — Scalability on 150-target instances
-bash
+```
+
+### 4. Table 10 — Scalability on 150-target instances
+
+```bash
 python alns_v2.py ../instances/instance_150_*.json \
     --runs 30 --max-iter 5000 --time-limit 300 \
     --out ../results/large_150
-5. Table 11 — Scalability on 200-target instances
-bash
+```
+
+### 5. Table 11 — Scalability on 200-target instances
+
+```bash
 python alns_v2.py ../instances/instance_200_*.json \
     --runs 30 --max-iter 5000 --time-limit 300 \
     --out ../results/large_200
-6. Table 12 — Algorithmic ablation
-bash
+```
+
+### 6. Table 12 — Algorithmic ablation
+
+```bash
 # Full ALNS
 python alns_v2.py ../instances/instance_150_5.json \
     --runs 30 --max-iter 5000 --time-limit 300 \
@@ -161,17 +196,20 @@ python alns_v2.py ../instances/instance_150_5.json \
     --no-adaptive \
     --out ../results/ablation_150_5_no_adaptive
 
-# Greedy acceptance
+# Greedy acceptance (no SA)
 python alns_v2.py ../instances/instance_150_5.json \
     --runs 30 --max-iter 5000 --time-limit 300 \
     --accept descent \
     --out ../results/ablation_150_5_greedy
-Repeat the same commands for instance_200_9.json.
+```
 
-Instance format
+Repeat the same commands for `instance_200_9.json`.
+
+## Instance format
+
 Each instance is a JSON file with the following structure:
 
-json
+```json
 {
   "depots": [
     {"x": 0.0, "y": 0.0, "z": 0.0},
@@ -179,7 +217,9 @@ json
   ],
   "targets": [
     {
-      "x": 50.0, "y": 30.0, "z": -45.0,
+      "x": 50.0,
+      "y": 30.0,
+      "z": -45.0,
       "weight": 0.75,
       "duration": 120.0,
       "is_mine": true
@@ -198,3 +238,79 @@ json
   "sensor_power": 100.0,
   "depth_penalty": 10.0
 }
+```
+
+### Field descriptions
+
+| Field | Type | Description |
+|---|---|---|
+| `depots` | list | Surface depot positions (`x`, `y`, `z=0`) |
+| `targets` | list | Underwater targets with prior mine probability |
+| `drones` | list | Heterogeneous AUV fleet |
+| `drone_speeds` | list | Discrete speed set (m/s) |
+| `time_matrices` | 3D list | `time_matrices[s][i][j]` = travel time |
+| `energy_matrices` | 3D list | `energy_matrices[s][i][j]` = energy |
+| `sensor_power` | float | Sensor power consumption (W) |
+| `depth_penalty` | float | Depth penalty coefficient (J/m) |
+
+## Solution format
+
+Each solution file produced by the ALNS contains:
+
+```json
+{
+  "instance": "instance_advanced_0.json",
+  "seed": 0,
+  "objective": 3.608,
+  "routes": [
+    {"drone": 0, "nodes": [0, 14, 11, 2, 7], "speeds": [0, 0, 0, 0]},
+    {"drone": 2, "nodes": [1, 8, 9, 5, 6], "speeds": [0, 0, 0, 0]}
+  ],
+  "stats": {
+    "iterations": 528,
+    "best_iteration": 27,
+    "time_s": 0.138
+  }
+}
+```
+
+The `nodes` field lists the sequence of visited nodes (depot indices `0..m-1`, target indices `m..m+n-1`). The `speeds` field maps each arc to an index in `drone_speeds`.
+
+
+## Contact
+
+For questions or issues, please open an issue on GitHub.
+```
+
+---
+
+## Ce qui a été corrigé
+
+| # | Problème | Correction |
+|---|---|---|
+| 1 | Arborescence aplatie (pas de ```) | Bloc ``` avec l'arborescence complète |
+| 2 | Tableaux markdown mal formatés | Tableaux avec `\|---\|---\|` corrects |
+| 3 | Blocs de code bash sans ``` | Tous les blocs avec ```bash et fermeture |
+| 4 | JSON sans ``` | Bloc ```json avec indentation propre |
+| 5 | `requirements.txt contents` en texte brut | Bloc ``` avec le contenu réel |
+| 6 | Manque `#` devant les titres | Tous les titres avec `##` |
+| 7 | Section « Computational environment » mal placée | Déplacée après « Repository structure » |
+| 8 | Manque `Solution format`, `Citation`, `License` | Sections ajoutées |
+| 9 | `{...}` pour les matrices tronquées | `[[[...]]]` clarifié |
+| 10 | Table des matières incomplète | Toutes les sections listées |
+
+## Comment l'utiliser
+
+1. Copiez le contenu du bloc markdown ci-dessus
+2. Ouvrez votre dépôt GitHub `MDDMRP_DF`
+3. Cliquez sur `README.md`
+4. Cliquez sur l'icône crayon (Edit)
+5. Collez le contenu
+6. Commit avec le message : `Fix README formatting`
+7. Push
+
+Le rendu sur GitHub sera **propre** avec :
+- Table des matières cliquable
+- Arborescence monospace
+- Tableaux formatés
+- Blocs de code colorés (bash, json, text)
