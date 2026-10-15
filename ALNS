@@ -1,851 +1,884 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ALNS pour MDDMRP-DF - Version avec multiples runs et analyse statistique
+ALNS pour le MDDMRP-DF (Multi-Depot Drone Marine Routing Problem with Flexible Depots).
+
+Ce fichier implemente l'algorithme decrit dans la Section 4 du manuscrit, avec
+les precisions suivantes (a reporter dans le texte, voir README en fin de fichier) :
+
+  * Representation : une route = liste ordonnee de CIBLES ; le depot de depart
+    est delta_k (fixe) et le depot d'arrivee est le depot de cout minimal depuis
+    la derniere cible. Une route vide = drone non active. Aucune route ne peut
+    donc passer par un depot en cours de route (coherent avec le MILP).
+  * Vitesses : l'energie du modele est separable par arc et il n'y a pas de
+    contrainte de duree ; la vitesse optimale d'un arc est donc argmin_s e_ij^s
+    (calculee une fois pour toutes). L'operateur "speed-reoptimisation" du
+    manuscrit est de ce fait redondant et n'est pas implemente comme operateur.
+  * Operateurs de destruction : random, worst-energy, cluster, current-sensitive.
+  * Operateurs de reparation : greedy (ratio recompense / energie incrementale,
+    meilleure insertion globale, jusqu'a epuisement) ; regret-2 (optionnel,
+    NON present dans le manuscrit, desactive par defaut).
+  * Recherche locale : 2-opt intra-route, relocate inter-route, exchange
+    inter-route ; premiere amelioration ; critere = reduction de l'energie
+    totale ; appliquee a chaque iteration (ls_freq = 1) jusqu'a un optimum
+    local pour les trois voisinages.
+  * Solution initiale (Algorithme 2) : cibles triees par w_j / e_bar_j,
+    insertion de plus faible energie incrementale (equivaut a maximiser
+    w_j - eps * delta_e), puis une recherche locale.
+  * Critere d'acceptation : recuit simule (l'Algorithme 1 du manuscrit ne
+    precise pas de critere d'acceptation : a ajouter dans le texte).
+  * Classement aleatoire (puissance p, Ropke & Pisinger 2006) pour worst-energy
+    et current-sensitive (ajout par rapport au manuscrit ; p = None => deterministe).
+  * Scores 3 / 2 / 1 ; poids mis a jour tous les 100 iterations par
+    w <- (1-rho) w + rho * theta_o / sum(theta) ; rho = 0.10.
+  * Objectif : couverture ponderee - eps * energie (propulsion + chaleur de
+    bord + penalite de profondeur + capteurs), eps = 1e-7 par joule : identique
+    a l'objectif du MILP.
+
+Chaque solution finale est verifiee par un validateur independant (matrices
+brutes du JSON) avant d'etre enregistree.
 """
 
+import argparse
+import csv
+import glob
 import json
-import random
 import math
+import os
+import random
 import sys
 import time
-import csv
-import os
-from typing import List, Tuple, Dict, Optional
-from dataclasses import dataclass, field
-from collections import defaultdict
-import numpy as np
+from dataclasses import dataclass
+from multiprocessing import Pool, cpu_count
+from typing import Dict, List, Optional, Tuple
 
-# ============================================================
+BIG = 1e15            # cout d'un arc infaisable (jamais choisi : depasse tout budget)
+INF_TIME = 1e8        # seuil M du manuscrit : tau >= M => arc infaisable
+TOL = 1e-6
+
+
+# ======================================================================
 # CONFIGURATION
-# ============================================================
+# ======================================================================
 @dataclass
-class ALNSConfig:
+class Config:
     max_iter: int = 5000
     max_no_improve: int = 500
     time_limit: float = 300.0
     q_min: float = 0.05
     q_max: float = 0.30
+    segment_length: int = 100
+    rho: float = 0.10
+    sigma_best: float = 3.0
+    sigma_better: float = 2.0
+    sigma_feasible: float = 1.0
+    eps: float = 1e-7                      # penalite energetique (mines par joule)
+    ls_freq: int = 1                       # 0 = pas de recherche locale
+    accept: str = "sa"                     # "sa" ou "descent"
     accept_rate_init: float = 0.8
     cooling_rate: float = 0.995
-    segment_length: int = 100
-    rho: float = 0.1
-    sigma1: float = 5.0
-    sigma2: float = 3.0
-    sigma3: float = 1.0
-    local_search_freq: int = 50
-    lambda_energy: float = 1e-7
+    temp_floor: float = 1e-3
+    rand_p: Optional[float] = 4.0          # None = classement deterministe
+    destroy_ops: Tuple[str, ...] = ("random", "worst", "cluster", "current")
+    repair_ops: Tuple[str, ...] = ("greedy",)
+    adaptive: bool = True
 
 
-# ============================================================
+# ======================================================================
 # INSTANCE
-# ============================================================
-@dataclass
+# ======================================================================
 class Instance:
-    depots: List[dict]
-    targets: List[dict]
-    drones: List[dict]
-    speeds: List[float]
-    time_matrices: List[List[List[float]]]
-    energy_matrices: List[List[List[float]]]
-    sensor_power: float
+    """Noeuds : 0..nd-1 = depots ; nd..nd+nt-1 = cibles."""
 
-    depot_count: int = field(init=False)
-    n_targets: int = field(init=False)
-    n_speeds: int = field(init=False)
-    n_nodes: int = field(init=False)
+    def __init__(self, data: dict, name: str = ""):
+        self.name = name
+        depots, targets, drones = data["depots"], data["targets"], data["drones"]
+        self.nd, self.nt = len(depots), len(targets)
+        self.n = self.nd + self.nt
+        self.speeds = list(data["drone_speeds"])
+        self.S = len(self.speeds)
+        self.sensor_power = float(data["sensor_power"])
+        self.gamma = float(data["depth_penalty"])
 
-    target_weights: List[float] = field(init=False)
-    target_depths: List[float] = field(init=False)
-    target_durations: List[float] = field(init=False)
+        self.w = [0.0] * self.n
+        self.h = [0.0] * self.n            # profondeur absolue (0 pour les depots)
+        self.sens = [0.0] * self.n         # energie capteur (J) par noeud
+        self.is_mine = [False] * self.n
+        for j, t in enumerate(targets):
+            u = self.nd + j
+            self.w[u] = float(t["weight"])
+            self.h[u] = abs(float(t["z"]))
+            self.sens[u] = self.sensor_power * float(t["duration"])
+            self.is_mine[u] = bool(t.get("is_mine", False))
+        self.total_weight = sum(self.w)
 
-    drone_E_max: List[float] = field(init=False)
-    drone_H_max: List[float] = field(init=False)
-    drone_start_depot: List[int] = field(init=False)
+        self.K = len(drones)
+        self.E = [float(d["E_max"]) for d in drones]
+        self.H = [float(d["H_max"]) for d in drones]
+        self.start = [int(d["start_depot"]) for d in drones]
 
-    coords: Dict[int, Tuple[float, float, float]] = field(default_factory=dict)
-    dist_matrix: np.ndarray = field(init=False)
-    best_speed_matrix: np.ndarray = field(init=False)
+        self.xyz = [(d["x"], d["y"], d["z"]) for d in depots] + \
+                   [(t["x"], t["y"], t["z"]) for t in targets]
 
-    max_dist: float = field(init=False)
-    max_depth: float = field(init=False)
-    max_weight: float = field(init=False)
-
-    INF: float = 1e8
-
-    def __post_init__(self):
-        self.depot_count = len(self.depots)
-        self.n_targets = len(self.targets)
-        self.n_speeds = len(self.speeds)
-        self.n_nodes = self.depot_count + self.n_targets
-
-        self.target_weights = [t["weight"] for t in self.targets]
-        self.target_depths = [t["z"] for t in self.targets]
-        self.target_durations = [t["duration"] for t in self.targets]
-
-        self.drone_E_max = [d["E_max"] for d in self.drones]
-        self.drone_H_max = [d["H_max"] for d in self.drones]
-        self.drone_start_depot = [d["start_depot"] for d in self.drones]
-
-        for i, d in enumerate(self.depots):
-            self.coords[i] = (d["x"], d["y"], d["z"])
-        for i, t in enumerate(self.targets):
-            self.coords[self.depot_count + i] = (t["x"], t["y"], t["z"])
-
-        self.dist_matrix = np.zeros((self.n_nodes, self.n_nodes))
-        for i in range(self.n_nodes):
-            for j in range(self.n_nodes):
-                if i != j:
-                    xi, yi, zi = self.coords[i]
-                    xj, yj, zj = self.coords[j]
-                    self.dist_matrix[i][j] = math.sqrt((xi-xj)**2 + (yi-yj)**2 + (zi-zj)**2)
-
-        self.max_dist = np.max(self.dist_matrix) + 1e-9
-        self.max_depth = max(abs(z) for z in self.target_depths) + 1e-9
-        self.max_weight = max(self.target_weights) + 1e-9
-
-        self.best_speed_matrix = np.zeros((self.n_nodes, self.n_nodes), dtype=int)
-        for i in range(self.n_nodes):
-            for j in range(self.n_nodes):
-                if i != j:
-                    best_s = 0
-                    best_e = float('inf')
-                    for s in range(self.n_speeds):
-                        if self.arc_feasible(i, j, s):
-                            e = self.energy_matrices[s][i][j]
-                            if e < best_e:
-                                best_e = e
-                                best_s = s
-                    self.best_speed_matrix[i][j] = best_s
-
-    def is_target(self, node: int) -> bool:
-        return node >= self.depot_count
-
-    def get_target_idx(self, node: int) -> int:
-        return node - self.depot_count
-
-    def arc_feasible(self, i: int, j: int, s: int) -> bool:
-        return self.time_matrices[s][i][j] < self.INF
-
-    def get_best_return_energy(self, from_node: int) -> Tuple[float, int, int]:
-        best_e = float('inf')
-        best_d = -1
-        best_s = 0
-        for d in range(self.depot_count):
-            for s in range(self.n_speeds):
-                if self.arc_feasible(from_node, d, s):
-                    e = self.energy_matrices[s][from_node][d]
-                    if e < best_e:
-                        best_e = e
-                        best_d = d
-                        best_s = s
-        return best_e, best_d, best_s
-
-    def compute_closed_energy(self, route: 'DroneRoute') -> float:
-        if len(route.nodes) <= 1:
-            return 0.0
-        if route.nodes[-1] < self.depot_count:
-            return route.total_energy()
-        last = route.nodes[-1]
-        best_return, _, _ = self.get_best_return_energy(last)
-        return route.total_energy() + best_return
-
-
-# ============================================================
-# DRONE ROUTE
-# ============================================================
-class DroneRoute:
-    def __init__(self, drone_id: int, start_depot: int, E_max: float,
-                 H_max: float, speed_set: List[float]):
-        self.drone_id = drone_id
-        self.start_depot = start_depot
-        self.E_max = E_max
-        self.H_max = H_max
-        self.speed_set = speed_set
-
-        self.nodes: List[int] = [start_depot]
-        self.speeds: List[int] = []
-        self.energy_prop = 0.0
-        self.energy_sensor = 0.0
-        self.end_depot: Optional[int] = None
-
-    def copy(self):
-        new = DroneRoute(self.drone_id, self.start_depot, self.E_max,
-                         self.H_max, self.speed_set)
-        new.nodes = self.nodes.copy()
-        new.speeds = self.speeds.copy()
-        new.energy_prop = self.energy_prop
-        new.energy_sensor = self.energy_sensor
-        new.end_depot = self.end_depot
-        return new
-
-    def total_energy(self) -> float:
-        return self.energy_prop + self.energy_sensor
-
-    def remaining_energy(self) -> float:
-        return self.E_max - self.total_energy()
-
-    def target_nodes(self, depot_count: int) -> List[int]:
-        return [n for n in self.nodes if n >= depot_count]
-
-    def target_count(self, depot_count: int) -> int:
-        return len(self.target_nodes(depot_count))
-
-    def is_empty(self) -> bool:
-        return len(self.nodes) == 1
-
-    def __repr__(self):
-        return f"Route(D{self.drone_id}: {self.nodes}, E={self.total_energy():.1f}/{self.E_max:.1f})"
-
-
-# ============================================================
-# SOLUTION
-# ============================================================
-class Solution:
-    def __init__(self, instance: Instance):
-        self.instance = instance
-        self.routes: List[DroneRoute] = []
-        self.covered = [False] * instance.n_targets
-        self.total_coverage = 0.0
-        self.total_energy = 0.0
-
-    def copy(self):
-        new = Solution(self.instance)
-        new.routes = [r.copy() for r in self.routes]
-        new.covered = self.covered.copy()
-        new.total_coverage = self.total_coverage
-        new.total_energy = self.total_energy
-        return new
-
-    def compute_objective(self, lambda_energy: float = 1e-7) -> float:
-        return self.total_coverage - lambda_energy * self.total_energy
-
-    def update_from_routes(self):
-        self.covered = [False] * self.instance.n_targets
-        self.total_coverage = 0.0
-        self.total_energy = 0.0
-        for route in self.routes:
-            self.total_energy += route.total_energy()
-            for node in route.nodes:
-                if self.instance.is_target(node):
-                    t = self.instance.get_target_idx(node)
-                    if not self.covered[t]:
-                        self.covered[t] = True
-                        self.total_coverage += self.instance.target_weights[t]
-
-    def recalc_route_energy(self, route: DroneRoute):
-        route.energy_prop = 0.0
-        route.energy_sensor = 0.0
-        for idx in range(len(route.nodes) - 1):
-            i = route.nodes[idx]
-            j = route.nodes[idx + 1]
-            if idx < len(route.speeds):
-                s = route.speeds[idx]
-                route.energy_prop += self.instance.energy_matrices[s][i][j]
-        for node in route.nodes:
-            if self.instance.is_target(node):
-                t = self.instance.get_target_idx(node)
-                route.energy_sensor += self.instance.sensor_power * self.instance.target_durations[t]
-
-    def recalc_all_energies(self):
-        for route in self.routes:
-            self.recalc_route_energy(route)
-        self.update_from_routes()
-
-    def is_feasible(self) -> bool:
-        inst = self.instance
-        visited_targets = set()
-        for route in self.routes:
-            closed_energy = inst.compute_closed_energy(route)
-            if closed_energy > route.E_max + 1e-6:
-                return False
-            for node in route.nodes:
-                if inst.is_target(node):
-                    t = inst.get_target_idx(node)
-                    if abs(inst.target_depths[t]) > route.H_max + 1e-6:
-                        return False
-            for idx in range(len(route.nodes) - 1):
-                i, j = route.nodes[idx], route.nodes[idx + 1]
-                if idx < len(route.speeds):
-                    s = route.speeds[idx]
-                    if not inst.arc_feasible(i, j, s):
-                        return False
-            if route.nodes[0] != route.start_depot:
-                return False
-            last = route.nodes[-1]
-            if last >= inst.depot_count:
-                ret, _, _ = inst.get_best_return_energy(last)
-                if ret == float('inf'):
-                    return False
-            for node in route.nodes:
-                if inst.is_target(node):
-                    if node in visited_targets:
-                        return False
-                    visited_targets.add(node)
-        return True
-
-    def get_unassigned_targets(self) -> List[int]:
-        return [t for t in range(self.instance.n_targets) if not self.covered[t]]
-
-    def close_all_routes(self) -> None:
-        inst = self.instance
-        for route in self.routes:
-            if len(route.nodes) <= 1:
-                continue
-            if route.nodes[-1] >= inst.depot_count:
-                last = route.nodes[-1]
-                ret_energy, best_depot, best_speed = inst.get_best_return_energy(last)
-                if ret_energy < float('inf'):
-                    route.nodes.append(best_depot)
-                    route.speeds.append(best_speed)
-                    route.energy_prop += ret_energy
-                    route.end_depot = best_depot
-        self.recalc_all_energies()
-
-
-# ============================================================
-# UTILITAIRES
-# ============================================================
-def rebuild_speeds(route: DroneRoute, instance: Instance):
-    route.speeds = []
-    for idx in range(len(route.nodes) - 1):
-        i = route.nodes[idx]
-        j = route.nodes[idx + 1]
-        route.speeds.append(instance.best_speed_matrix[i][j])
-
-
-# ============================================================
-# CONSTRUCTION INITIALE
-# ============================================================
-def build_initial_solution(instance: Instance, rng: random.Random, alpha: float = 0.3) -> Solution:
-    sol = Solution(instance)
-    for k, drone in enumerate(instance.drones):
-        route = DroneRoute(k, drone["start_depot"], drone["E_max"], drone["H_max"], instance.speeds)
-        sol.routes.append(route)
-
-    target_scores = []
-    for t in range(instance.n_targets):
-        target_node = instance.depot_count + t
-        min_energy = float('inf')
-        for d in range(instance.depot_count):
-            e = instance.energy_matrices[0][d][target_node]
-            min_energy = min(min_energy, e)
-        return_est, _, _ = instance.get_best_return_energy(target_node)
-        total_est = min_energy + return_est
-        score = instance.target_weights[t] / (total_est + 1e-9)
-        target_scores.append((t, score))
-    target_scores.sort(key=lambda x: x[1], reverse=True)
-    unassigned = set(t for t, _ in target_scores)
-
-    while unassigned:
-        all_insertions = []
-        for t in unassigned:
-            target_node = instance.depot_count + t
-            depth = abs(instance.target_depths[t])
-            sensor_energy = instance.sensor_power * instance.target_durations[t]
-            for d_idx, route in enumerate(sol.routes):
-                if depth > route.H_max + 1e-6:
+        # matrices brutes (pour le validateur) et couts "meilleure vitesse"
+        self.tm = data["time_matrices"]
+        self.em = data["energy_matrices"]
+        n, S = self.n, self.S
+        self.c = [[BIG] * n for _ in range(n)]
+        self.sp = [[0] * n for _ in range(n)]
+        self.pen = [[0.0] * n for _ in range(n)]   # penalite due au courant (J)
+        self.dist = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            xi, yi, zi = self.xyz[i]
+            for j in range(n):
+                if i == j:
                     continue
-                for pos in range(len(route.nodes)):
-                    prev_node = route.nodes[pos]
-                    next_node = route.nodes[pos+1] if pos+1 < len(route.nodes) else None
-                    is_before_depot = (next_node is not None and next_node < instance.depot_count)
-                    for s_idx in range(instance.n_speeds):
-                        if not instance.arc_feasible(prev_node, target_node, s_idx):
-                            continue
-                        old_energy = 0.0
-                        new_energy = instance.energy_matrices[s_idx][prev_node][target_node]
-                        if next_node is not None:
-                            if not instance.arc_feasible(target_node, next_node, s_idx):
-                                continue
-                            if not is_before_depot:
-                                old_s = route.speeds[pos] if pos < len(route.speeds) else 0
-                                old_energy = instance.energy_matrices[old_s][prev_node][next_node]
-                            new_energy += instance.energy_matrices[s_idx][target_node][next_node]
-                        delta_prop = new_energy - old_energy
-                        delta_total = delta_prop + sensor_energy
-                        future_energy = 0.0
-                        if next_node is not None and not is_before_depot:
-                            for future_idx in range(pos+1, len(route.nodes)):
-                                future_node = route.nodes[future_idx]
-                                if future_idx < len(route.speeds):
-                                    future_s = route.speeds[future_idx]
-                                    future_next = route.nodes[future_idx+1] if future_idx+1 < len(route.nodes) else None
-                                    if future_next is not None:
-                                        future_energy += instance.energy_matrices[future_s][future_node][future_next]
-                        last_node = target_node if is_before_depot or next_node is None else next_node
-                        return_est, _, _ = instance.get_best_return_energy(last_node)
-                        total_needed = delta_total + future_energy + return_est
-                        if route.total_energy() + total_needed > route.E_max + 1e-6:
-                            continue
-                        reward = instance.target_weights[t]
-                        gain = reward - 1e-7 * delta_total
-                        all_insertions.append((gain, t, d_idx, pos, s_idx, is_before_depot, next_node))
-        if not all_insertions:
-            break
-        all_insertions.sort(key=lambda x: x[0], reverse=True)
-        best_gain = all_insertions[0][0]
-        worst_gain = all_insertions[-1][0]
-        threshold = best_gain - alpha * (best_gain - worst_gain)
-        rcl = [ins for ins in all_insertions if ins[0] >= threshold]
-        chosen = rng.choice(rcl)
-        _, t, d_idx, pos, s_idx, is_before_depot, next_node = chosen
-        target_node = instance.depot_count + t
-        route = sol.routes[d_idx]
-        insert_pos = pos + 1
-        route.nodes.insert(insert_pos, target_node)
-        rebuild_speeds(route, instance)
-        sol.recalc_route_energy(route)
-        unassigned.remove(t)
+                xj, yj, zj = self.xyz[j]
+                self.dist[i][j] = math.sqrt((xi - xj) ** 2 + (yi - yj) ** 2 + (zi - zj) ** 2)
+                best, bs = BIG, 0
+                for s in range(S):
+                    if self.tm[s][i][j] < INF_TIME:
+                        e = self.em[s][i][j]
+                        if e < best:
+                            best, bs = e, s
+                self.c[i][j] = best
+                self.sp[i][j] = bs
+                if best < BIG:
+                    # energie sans courant : e0 = (e - gamma*h_j) * (tau0 / tau) + gamma*h_j
+                    s = bs
+                    tau = self.tm[s][i][j]
+                    tau0 = self.dist[i][j] / self.speeds[s]
+                    g = self.gamma * self.h[j]
+                    self.pen[i][j] = (best - g) * (1.0 - tau0 / tau)
 
-    sol.recalc_all_energies()
+        # cout de retour au depot le plus economique
+        self.ret = [BIG] * n
+        self.ret_depot = [0] * n
+        for x in range(self.nd, n):
+            best, bd = BIG, 0
+            for d in range(self.nd):
+                if self.c[x][d] < best:
+                    best, bd = self.c[x][d], d
+            self.ret[x], self.ret_depot[x] = best, bd
+
+    def targets(self) -> range:
+        return range(self.nd, self.n)
+
+
+def load_instance(path: str) -> Instance:
+    with open(path, "r") as f:
+        data = json.load(f)
+    return Instance(data, os.path.basename(path))
+
+
+# ======================================================================
+# SOLUTION
+# ======================================================================
+def route_energy(inst: Instance, k: int, r: List[int]) -> float:
+    """Energie fermee (arcs + retour + capteurs) d'une route de cibles."""
+    if not r:
+        return 0.0
+    c = inst.c
+    e = c[inst.start[k]][r[0]]
+    for a, b in zip(r, r[1:]):
+        e += c[a][b]
+    e += inst.ret[r[-1]]
+    sens = inst.sens
+    for x in r:
+        e += sens[x]
+    return e
+
+
+class Solution:
+    __slots__ = ("inst", "routes", "re", "visited", "cov", "energy")
+
+    def __init__(self, inst: Instance):
+        self.inst = inst
+        self.routes: List[List[int]] = [[] for _ in range(inst.K)]
+        self.re = [0.0] * inst.K
+        self.visited = [False] * inst.n
+        self.cov = 0.0
+        self.energy = 0.0
+
+    def copy(self) -> "Solution":
+        s = Solution.__new__(Solution)
+        s.inst = self.inst
+        s.routes = [r[:] for r in self.routes]
+        s.re = self.re[:]
+        s.visited = self.visited[:]
+        s.cov = self.cov
+        s.energy = self.energy
+        return s
+
+    def touch(self, k: int):
+        self.re[k] = route_energy(self.inst, k, self.routes[k])
+
+    def finalize(self):
+        inst = self.inst
+        self.visited = [False] * inst.n
+        cov = 0.0
+        for r in self.routes:
+            for u in r:
+                self.visited[u] = True
+                cov += inst.w[u]
+        self.cov = cov
+        self.energy = sum(self.re)
+
+    def objective(self, eps: float) -> float:
+        return self.cov - eps * self.energy
+
+    def n_visited(self) -> int:
+        return sum(len(r) for r in self.routes)
+
+
+# ======================================================================
+# DELTAS D'ENERGIE (exacts, O(1))
+# ======================================================================
+def ins_delta(inst: Instance, k: int, r: List[int], pos: int, u: int) -> float:
+    """Variation d'energie fermee en inserant u a l'indice pos de r (capteur inclus)."""
+    c, ret = inst.c, inst.ret
+    if not r:
+        return c[inst.start[k]][u] + ret[u] + inst.sens[u]
+    if pos == 0:
+        s, nx = inst.start[k], r[0]
+        return c[s][u] + c[u][nx] - c[s][nx] + inst.sens[u]
+    pv = r[pos - 1]
+    if pos == len(r):
+        return c[pv][u] + ret[u] - ret[pv] + inst.sens[u]
+    nx = r[pos]
+    return c[pv][u] + c[u][nx] - c[pv][nx] + inst.sens[u]
+
+
+def rem_delta(inst: Instance, k: int, r: List[int], pos: int) -> float:
+    """Variation d'energie fermee en retirant r[pos] (capteur inclus ; <= 0 en general)."""
+    c, ret = inst.c, inst.ret
+    u = r[pos]
+    n = len(r)
+    if n == 1:
+        return -(c[inst.start[k]][u] + ret[u] + inst.sens[u])
+    if pos == 0:
+        s, nx = inst.start[k], r[1]
+        return c[s][nx] - c[s][u] - c[u][nx] - inst.sens[u]
+    pv = r[pos - 1]
+    if pos == n - 1:
+        return ret[pv] - c[pv][u] - ret[u] - inst.sens[u]
+    nx = r[pos + 1]
+    return c[pv][nx] - c[pv][u] - c[u][nx] - inst.sens[u]
+
+
+def repl_delta(inst: Instance, k: int, r: List[int], pos: int, v: int) -> float:
+    """Variation d'energie en remplacant r[pos] par v (capteurs inclus)."""
+    c, ret = inst.c, inst.ret
+    u = r[pos]
+    pv = inst.start[k] if pos == 0 else r[pos - 1]
+    if pos == len(r) - 1:
+        d = c[pv][v] + ret[v] - c[pv][u] - ret[u]
+    else:
+        nx = r[pos + 1]
+        d = c[pv][v] + c[v][nx] - c[pv][u] - c[u][nx]
+    return d + inst.sens[v] - inst.sens[u]
+
+
+def depth_ok(inst: Instance, k: int, u: int) -> bool:
+    return inst.h[u] <= inst.H[k] + TOL
+
+
+# ======================================================================
+# RECHERCHE LOCALE (2-opt, relocate, exchange ; premiere amelioration)
+# ======================================================================
+def two_opt(inst: Instance, sol: Solution) -> bool:
+    c, ret = inst.c, inst.ret
+    improved_any = False
+    for k in range(inst.K):
+        r = sol.routes[k]
+        while len(r) >= 2:
+            n = len(r)
+            v = [inst.start[k]] + r
+            Fp = [0.0] * (n + 1)
+            Rp = [0.0] * (n + 1)
+            for m in range(n):
+                Fp[m + 1] = Fp[m] + c[v[m]][v[m + 1]]
+                Rp[m + 1] = Rp[m] + c[v[m + 1]][v[m]]
+            found = False
+            for i in range(1, n):
+                a = v[i - 1]
+                vi = v[i]
+                for j in range(i + 1, n + 1):
+                    vj = v[j]
+                    if j < n:
+                        nx = v[j + 1]
+                        removed = c[a][vi] + (Fp[j] - Fp[i]) + c[vj][nx]
+                        added = c[a][vj] + (Rp[j] - Rp[i]) + c[vi][nx]
+                    else:
+                        removed = c[a][vi] + (Fp[j] - Fp[i]) + ret[vj]
+                        added = c[a][vj] + (Rp[j] - Rp[i]) + ret[vi]
+                    d = added - removed
+                    if d < -1e-9 and sol.re[k] + d <= inst.E[k] + TOL:
+                        r[i - 1:j] = r[i - 1:j][::-1]
+                        old = sol.re[k]
+                        sol.touch(k)
+                        if sol.re[k] >= old - 1e-9:      # garde-fou (ne doit pas arriver)
+                            r[i - 1:j] = r[i - 1:j][::-1]
+                            sol.touch(k)
+                            continue
+                        found = True
+                        improved_any = True
+                        break
+                if found:
+                    break
+            if not found:
+                break
+    if improved_any:
+        sol.finalize()
+    return improved_any
+
+
+def relocate_inter(inst: Instance, sol: Solution) -> bool:
+    """Deplace une cible vers une autre route si l'energie totale diminue (premiere amelioration)."""
+    c = inst.c
+    improved_any = False
+    while True:
+        found = False
+        for k1 in range(inst.K):
+            r1 = sol.routes[k1]
+            for p1 in range(len(r1)):
+                u = r1[p1]
+                rem = rem_delta(inst, k1, r1, p1)            # inclut -sens[u]
+                if sol.re[k1] + rem > inst.E[k1] + TOL:      # (retrait augmentant l'energie)
+                    continue
+                for k2 in range(inst.K):
+                    if k2 == k1 or not depth_ok(inst, k2, u):
+                        continue
+                    r2 = sol.routes[k2]
+                    slack = inst.E[k2] + TOL - sol.re[k2]
+                    for p2 in range(len(r2) + 1):
+                        ins = ins_delta(inst, k2, r2, p2, u)   # inclut +sens[u]
+                        if rem + ins < -1e-9 and ins <= slack:
+                            before = sol.re[k1] + sol.re[k2]
+                            r1.pop(p1)
+                            r2.insert(p2, u)
+                            sol.touch(k1)
+                            sol.touch(k2)
+                            if sol.re[k1] + sol.re[k2] >= before - 1e-9:   # garde-fou
+                                r2.pop(p2)
+                                r1.insert(p1, u)
+                                sol.touch(k1)
+                                sol.touch(k2)
+                                continue
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            break
+        improved_any = True
+    if improved_any:
+        sol.finalize()
+    return improved_any
+
+
+def exchange_inter(inst: Instance, sol: Solution) -> bool:
+    improved_any = False
+    while True:
+        found = False
+        for k1 in range(inst.K):
+            r1 = sol.routes[k1]
+            for k2 in range(k1 + 1, inst.K):
+                r2 = sol.routes[k2]
+                for p1 in range(len(r1)):
+                    u1 = r1[p1]
+                    if not depth_ok(inst, k2, u1):
+                        continue
+                    for p2 in range(len(r2)):
+                        u2 = r2[p2]
+                        if not depth_ok(inst, k1, u2):
+                            continue
+                        d1 = repl_delta(inst, k1, r1, p1, u2)
+                        d2 = repl_delta(inst, k2, r2, p2, u1)
+                        if d1 + d2 < -1e-9 and \
+                                sol.re[k1] + d1 <= inst.E[k1] + TOL and \
+                                sol.re[k2] + d2 <= inst.E[k2] + TOL:
+                            before = sol.re[k1] + sol.re[k2]
+                            r1[p1], r2[p2] = u2, u1
+                            sol.touch(k1)
+                            sol.touch(k2)
+                            if sol.re[k1] + sol.re[k2] >= before - 1e-9:   # garde-fou
+                                r1[p1], r2[p2] = u1, u2
+                                sol.touch(k1)
+                                sol.touch(k2)
+                                continue
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            break
+        improved_any = True
+    if improved_any:
+        sol.finalize()
+    return improved_any
+
+
+def local_search(inst: Instance, sol: Solution, deadline: float, max_cycles: int = 50) -> Solution:
+    """2-opt -> relocate -> exchange, repetes jusqu'a absence d'amelioration."""
+    for _ in range(max_cycles):
+        if time.time() > deadline:
+            break
+        a = two_opt(inst, sol)
+        b = relocate_inter(inst, sol)
+        c = exchange_inter(inst, sol)
+        if not (a or b or c):
+            break
+    sol.finalize()
     return sol
 
 
-# ============================================================
-# DESTRUCTION (version simplifiée pour garder le code lisible)
-# ============================================================
-class DestroyOperators:
-    @staticmethod
-    def _remove_target_from_route(route: DroneRoute, target_node: int, instance: Instance):
-        if target_node not in route.nodes:
-            return False
-        idx = route.nodes.index(target_node)
-        route.nodes.pop(idx)
-        rebuild_speeds(route, instance)
-        route.energy_prop = 0.0
-        route.energy_sensor = 0.0
-        for i in range(len(route.nodes)-1):
-            s = route.speeds[i]
-            route.energy_prop += instance.energy_matrices[s][route.nodes[i]][route.nodes[i+1]]
-        for node in route.nodes:
-            if instance.is_target(node):
-                t = instance.get_target_idx(node)
-                route.energy_sensor += instance.sensor_power * instance.target_durations[t]
-        if route.target_count(instance.depot_count) == 0:
-            route.nodes = [route.start_depot]
-            route.speeds = []
-            route.energy_prop = 0.0
-            route.energy_sensor = 0.0
-            route.end_depot = None
-        return True
-
-    @staticmethod
-    def random_removal(sol: Solution, q: int, rng: random.Random):
-        new_sol = sol.copy()
-        current = [t for t in range(sol.instance.n_targets) if sol.covered[t]]
-        to_remove = rng.sample(current, min(q, len(current))) if len(current) > q else current
-        removed = []
-        for t in to_remove:
-            target_node = sol.instance.depot_count + t
-            for route in new_sol.routes:
-                if DestroyOperators._remove_target_from_route(route, target_node, sol.instance):
-                    removed.append(t)
-                    break
-        new_sol.recalc_all_energies()
-        return new_sol, removed
-
-    @staticmethod
-    def worst_removal(sol: Solution, q: int, rng: random.Random):
-        # Version simplifiée -> on appelle random
-        return DestroyOperators.random_removal(sol, q, rng)
-
-    @staticmethod
-    def cluster_removal(sol: Solution, q: int, rng: random.Random):
-        return DestroyOperators.random_removal(sol, q, rng)
-
-    @staticmethod
-    def shaw_removal(sol: Solution, q: int, rng: random.Random):
-        return DestroyOperators.random_removal(sol, q, rng)
-
-    @staticmethod
-    def route_removal(sol: Solution, q: int, rng: random.Random):
-        return DestroyOperators.random_removal(sol, q, rng)
+# ======================================================================
+# REPARATION
+# ======================================================================
+def _best_insertion(inst: Instance, sol: Solution, k: int, u: int) -> Optional[Tuple[float, int]]:
+    """Meilleure (plus faible energie incrementale) insertion faisable de u dans la route k."""
+    if not depth_ok(inst, k, u):
+        return None
+    r = sol.routes[k]
+    slack = inst.E[k] + TOL - sol.re[k]
+    best, bp = None, -1
+    for pos in range(len(r) + 1):
+        d = ins_delta(inst, k, r, pos, u)
+        if d <= slack and (best is None or d < best):
+            best, bp = d, pos
+    if best is None:
+        return None
+    return best, bp
 
 
-# ============================================================
-# RÉPARATION (version simplifiée)
-# ============================================================
-class RepairOperators:
-    @staticmethod
-    def greedy_insertion(sol: Solution, removed: List[int], rng: random.Random) -> Solution:
-        new_sol = sol.copy()
-        inst = sol.instance
-        unassigned = set(removed + sol.get_unassigned_targets())
-        candidates = sorted(unassigned, key=lambda t: inst.target_weights[t], reverse=True)
-        for t in candidates:
-            if new_sol.covered[t]:
+def repair(inst: Instance, sol: Solution, mode: str) -> Solution:
+    """mode = 'greedy' : maximise w/delta_e ; 'regret2' : maximise le regret sur ce ratio."""
+    w = inst.w
+    remaining = [u for u in inst.targets() if not sol.visited[u]]
+    cache: Dict[int, List[Optional[Tuple[float, int]]]] = {
+        u: [_best_insertion(inst, sol, k, u) for k in range(inst.K)] for u in remaining
+    }
+    while remaining:
+        best_u, best_key, best_k, best_pos = None, None, -1, -1
+        for u in remaining:
+            lst = cache[u]
+            cand = [(e[0], k, e[1]) for k, e in enumerate(lst) if e is not None]
+            if not cand:
                 continue
-            target_node = inst.depot_count + t
-            depth = abs(inst.target_depths[t])
-            sensor_energy = inst.sensor_power * inst.target_durations[t]
-            best_gain = -1e9
-            best_action = None
-            for d_idx, route in enumerate(new_sol.routes):
-                if depth > route.H_max + 1e-6:
-                    continue
-                for pos in range(len(route.nodes)):
-                    prev_node = route.nodes[pos]
-                    next_node = route.nodes[pos+1] if pos+1 < len(route.nodes) else None
-                    is_before_depot = (next_node is not None and next_node < inst.depot_count)
-                    for s_idx in range(inst.n_speeds):
-                        if not inst.arc_feasible(prev_node, target_node, s_idx):
-                            continue
-                        old_energy = 0.0
-                        new_energy = inst.energy_matrices[s_idx][prev_node][target_node]
-                        if next_node is not None:
-                            if not inst.arc_feasible(target_node, next_node, s_idx):
-                                continue
-                            if not is_before_depot:
-                                old_s = route.speeds[pos] if pos < len(route.speeds) else 0
-                                old_energy = inst.energy_matrices[old_s][prev_node][next_node]
-                            new_energy += inst.energy_matrices[s_idx][target_node][next_node]
-                        delta_prop = new_energy - old_energy
-                        delta_total = delta_prop + sensor_energy
-                        future_energy = 0.0
-                        if next_node is not None and not is_before_depot:
-                            for future_idx in range(pos+1, len(route.nodes)):
-                                future_node = route.nodes[future_idx]
-                                if future_idx < len(route.speeds):
-                                    future_s = route.speeds[future_idx]
-                                    future_next = route.nodes[future_idx+1] if future_idx+1 < len(route.nodes) else None
-                                    if future_next is not None:
-                                        future_energy += inst.energy_matrices[future_s][future_node][future_next]
-                        last_node = target_node if is_before_depot or next_node is None else next_node
-                        ret_energy, _, _ = inst.get_best_return_energy(last_node)
-                        total_needed = delta_total + future_energy + ret_energy
-                        if route.total_energy() + total_needed > route.E_max + 1e-6:
-                            continue
-                        reward = inst.target_weights[t]
-                        gain = reward - 1e-7 * delta_total
-                        if gain > best_gain:
-                            best_gain = gain
-                            best_action = (d_idx, pos, s_idx, is_before_depot, next_node)
-            if best_action is not None:
-                d_idx, pos, s_idx, is_before_depot, next_node = best_action
-                route = new_sol.routes[d_idx]
-                insert_pos = pos + 1
-                route.nodes.insert(insert_pos, target_node)
-                rebuild_speeds(route, inst)
-                new_sol.recalc_route_energy(route)
-        new_sol.recalc_all_energies()
-        return new_sol
-
-    @staticmethod
-    def regret_insertion(sol: Solution, removed: List[int], rng: random.Random) -> Solution:
-        # Version simplifiée -> greedy
-        return RepairOperators.greedy_insertion(sol, removed, rng)
+            cand.sort()
+            d1, k1, p1 = cand[0]
+            ratio1 = w[u] / max(d1, 1e-9)
+            if mode == "regret2":
+                ratio2 = w[u] / max(cand[1][0], 1e-9) if len(cand) > 1 else 0.0
+                key = (ratio1 - ratio2, ratio1)
+            else:
+                key = (ratio1,)
+            if best_key is None or key > best_key:
+                best_u, best_key, best_k, best_pos = u, key, k1, p1
+        if best_u is None:
+            break
+        sol.routes[best_k].insert(best_pos, best_u)
+        sol.touch(best_k)
+        remaining.remove(best_u)
+        del cache[best_u]
+        for u in remaining:
+            cache[u][best_k] = _best_insertion(inst, sol, best_k, u)
+    sol.finalize()
+    return sol
 
 
-# ============================================================
-# RECHERCHE LOCALE
-# ============================================================
-class LocalSearch:
-    @staticmethod
-    def full_local_search(sol: Solution, rng: random.Random) -> Solution:
-        for route in sol.routes:
-            rebuild_speeds(route, sol.instance)
-            sol.recalc_route_energy(route)
-        sol.update_from_routes()
-        return sol
+# ======================================================================
+# DESTRUCTION
+# ======================================================================
+def _remove(sol: Solution, nodes: List[int]) -> None:
+    where = {}
+    for k, r in enumerate(sol.routes):
+        for u in r:
+            where[u] = k
+    touched = set()
+    for u in nodes:
+        k = where.get(u)
+        if k is not None:
+            sol.routes[k].remove(u)
+            touched.add(k)
+    for k in touched:
+        sol.touch(k)
+    sol.finalize()
 
 
-# ============================================================
-# ALNS (boucle principale)
-# ============================================================
+def _pick_ranked(ranked: List, q: int, rng: random.Random, p: Optional[float]) -> List:
+    """Selectionne q elements d'une liste classee (meilleur en tete) : deterministe ou y^p."""
+    ranked = list(ranked)
+    out = []
+    while ranked and len(out) < q:
+        if p is None:
+            idx = 0
+        else:
+            idx = min(int(len(ranked) * (rng.random() ** p)), len(ranked) - 1)
+        out.append(ranked.pop(idx))
+    return out
+
+
+def destroy(inst: Instance, sol: Solution, op: str, q: int, rng: random.Random,
+            rand_p: Optional[float]) -> Solution:
+    new = sol.copy()
+    visited = [u for r in new.routes for u in r]
+    if not visited:
+        return new
+    q = min(q, len(visited))
+    if op == "random":
+        rem = rng.sample(visited, q)
+    elif op == "worst":
+        items = []
+        for k, r in enumerate(new.routes):
+            for pos, u in enumerate(r):
+                items.append((-rem_delta(inst, k, r, pos), u))      # economie d'energie
+        items.sort(reverse=True)
+        rem = [u for _, u in _pick_ranked(items, q, rng, rand_p)]
+    elif op == "cluster":
+        seed = rng.choice(visited)
+        d = inst.dist[seed]
+        rem = sorted(visited, key=lambda u: (0.0 if u == seed else d[u]))[:q]
+    elif op == "current":
+        arcs = []                                   # (penalite, u_depart, u_arrivee)
+        for k, r in enumerate(new.routes):
+            if not r:
+                continue
+            seq = [inst.start[k]] + r
+            for a, b in zip(seq, seq[1:]):
+                arcs.append((inst.pen[a][b], a, b))
+        arcs.sort(reverse=True)
+        rem, seen = [], set()
+        ranked = list(arcs)
+        while ranked and len(rem) < q:
+            idx = 0 if rand_p is None else min(int(len(ranked) * (rng.random() ** rand_p)), len(ranked) - 1)
+            _, a, b = ranked.pop(idx)
+            for x in (a, b):
+                if x >= inst.nd and x not in seen and len(rem) < q:
+                    seen.add(x)
+                    rem.append(x)
+    else:
+        raise ValueError(op)
+    _remove(new, rem)
+    return new
+
+
+# ======================================================================
+# SOLUTION INITIALE (Algorithme 2)
+# ======================================================================
+def build_initial(inst: Instance, eps: float) -> Solution:
+    sol = Solution(inst)
+    ebar = {}
+    for u in inst.targets():
+        ebar[u] = min(inst.c[d][u] for d in range(inst.nd)) + inst.sens[u]
+    order = sorted(inst.targets(), key=lambda u: inst.w[u] / max(ebar[u], 1e-9), reverse=True)
+    for u in order:
+        best, bk, bp = None, -1, -1
+        for k in range(inst.K):
+            ins = _best_insertion(inst, sol, k, u)
+            if ins is not None and (best is None or ins[0] < best):
+                best, bk, bp = ins[0], k, ins[1]
+        if best is not None:
+            sol.routes[bk].insert(bp, u)
+            sol.touch(bk)
+    sol.finalize()
+    return sol
+
+
+# ======================================================================
+# SORTIE EXPLICITE + VALIDATEUR INDEPENDANT
+# ======================================================================
+def explicit_routes(sol: Solution) -> List[dict]:
+    inst = sol.inst
+    out = []
+    for k, r in enumerate(sol.routes):
+        if not r:
+            continue
+        nodes = [inst.start[k]] + r + [inst.ret_depot[r[-1]]]
+        speeds = [inst.sp[a][b] for a, b in zip(nodes, nodes[1:])]
+        out.append({"drone": k, "nodes": nodes, "speeds": speeds})
+    return out
+
+
+def validate(inst: Instance, sol: Solution) -> Tuple[float, float]:
+    """Verifie la solution contre les contraintes du MILP en n'utilisant que les matrices
+    brutes. Retourne (couverture ponderee, energie totale). Leve AssertionError sinon."""
+    seen = set()
+    cov = 0.0
+    total_e = 0.0
+    for rt in explicit_routes(sol):
+        k, nodes, speeds = rt["drone"], rt["nodes"], rt["speeds"]
+        assert nodes[0] == inst.start[k], "depart hors delta_k"
+        assert nodes[-1] < inst.nd, "la route ne se termine pas sur un depot"
+        mid = nodes[1:-1]
+        assert len(mid) >= 1, "drone active sans cible"
+        assert all(x >= inst.nd for x in mid), "depot au milieu d'une route"
+        e = 0.0
+        for (a, b), s in zip(zip(nodes, nodes[1:]), speeds):
+            assert inst.tm[s][a][b] < INF_TIME, "arc infaisable"
+            e += inst.em[s][a][b]
+        for x in mid:
+            assert x not in seen, "cible visitee deux fois"
+            seen.add(x)
+            assert inst.h[x] <= inst.H[k] + TOL, "profondeur depassee"
+            e += inst.sens[x]
+            cov += inst.w[x]
+        assert e <= inst.E[k] + 1e-3, "budget energetique depasse (%.3f > %.3f)" % (e, inst.E[k])
+        total_e += e
+    assert abs(cov - sol.cov) < 1e-9, "couverture incoherente"
+    assert abs(total_e - sol.energy) < 1e-3, "energie incoherente (%.4f vs %.4f)" % (total_e, sol.energy)
+    return cov, total_e
+
+
+# ======================================================================
+# ALNS
+# ======================================================================
 class ALNS:
-    def __init__(self, config: ALNSConfig, seed: int = 42):
-        self.config = config
+    def __init__(self, cfg: Config, seed: int):
+        self.cfg = cfg
         self.rng = random.Random(seed)
+        self.d_ops = list(cfg.destroy_ops)
+        self.r_ops = list(cfg.repair_ops)
+        self.d_w = [1.0 / len(self.d_ops)] * len(self.d_ops)
+        self.r_w = [1.0 / len(self.r_ops)] * len(self.r_ops)
+        self.d_theta = [0.0] * len(self.d_ops)
+        self.r_theta = [0.0] * len(self.r_ops)
 
-        self.destroy_ops = [
-            ("random", DestroyOperators.random_removal),
-            ("worst", DestroyOperators.worst_removal),
-            ("cluster", DestroyOperators.cluster_removal),
-            ("shaw", DestroyOperators.shaw_removal),
-            ("route", DestroyOperators.route_removal),
-        ]
-        self.repair_ops = [
-            ("greedy", RepairOperators.greedy_insertion),
-            ("regret", RepairOperators.regret_insertion),
-        ]
-        self.destroy_weights = [1.0] * len(self.destroy_ops)
-        self.repair_weights = [1.0] * len(self.repair_ops)
-        self.destroy_scores = [0.0] * len(self.destroy_ops)
-        self.repair_scores = [0.0] * len(self.repair_ops)
-        self.destroy_counts = [0] * len(self.destroy_ops)
-        self.repair_counts = [0] * len(self.repair_ops)
-
-    def _select_operator(self, weights):
-        total = sum(weights)
-        r = self.rng.random() * total
-        cumsum = 0.0
-        for i, w in enumerate(weights):
-            cumsum += w
-            if r <= cumsum:
+    def _roulette(self, weights: List[float]) -> int:
+        tot = sum(weights)
+        x = self.rng.random() * tot
+        acc = 0.0
+        for i, wt in enumerate(weights):
+            acc += wt
+            if x <= acc:
                 return i
-        return len(weights)-1
+        return len(weights) - 1
+
+    def _q(self, sol: Solution) -> int:
+        v = sol.n_visited()
+        return max(1, math.ceil(self.rng.uniform(self.cfg.q_min, self.cfg.q_max) * max(v, 1)))
 
     def _update_weights(self):
-        cfg = self.config
-        for i in range(len(self.destroy_ops)):
-            if self.destroy_counts[i] > 0:
-                score = self.destroy_scores[i] / self.destroy_counts[i]
-                self.destroy_weights[i] = (1 - cfg.rho) * self.destroy_weights[i] + cfg.rho * score
-        for i in range(len(self.repair_ops)):
-            if self.repair_counts[i] > 0:
-                score = self.repair_scores[i] / self.repair_counts[i]
-                self.repair_weights[i] = (1 - cfg.rho) * self.repair_weights[i] + cfg.rho * score
-        total_d = sum(self.destroy_weights)
-        total_r = sum(self.repair_weights)
-        self.destroy_weights = [w/total_d for w in self.destroy_weights]
-        self.repair_weights = [w/total_r for w in self.repair_weights]
-        self.destroy_scores = [0.0]*len(self.destroy_ops)
-        self.repair_scores = [0.0]*len(self.repair_ops)
-        self.destroy_counts = [0]*len(self.destroy_ops)
-        self.repair_counts = [0]*len(self.repair_ops)
+        cfg = self.cfg
+        if not cfg.adaptive:
+            self.d_theta = [0.0] * len(self.d_ops)
+            self.r_theta = [0.0] * len(self.r_ops)
+            return
+        for w, th in ((self.d_w, self.d_theta), (self.r_w, self.r_theta)):
+            s = sum(th)
+            if s > 0:
+                for i in range(len(w)):
+                    w[i] = (1 - cfg.rho) * w[i] + cfg.rho * th[i] / s
+            for i in range(len(th)):
+                th[i] = 0.0
 
-    def _compute_initial_temperature(self, instance):
-        sol = build_initial_solution(instance, self.rng)
-        worsening = []
+    def _init_temperature(self, inst: Instance, start: Solution) -> float:
+        cfg = self.cfg
+        f0 = start.objective(cfg.eps)
+        worse = []
         for _ in range(100):
-            d_idx = self.rng.randint(0, len(self.destroy_ops)-1)
-            q = max(1, int(0.1 * instance.n_targets))
-            destroyed, _ = self.destroy_ops[d_idx][1](sol, q, self.rng)
-            new_sol = RepairOperators.greedy_insertion(destroyed, [], self.rng)
-            if new_sol.is_feasible():
-                obj1 = sol.compute_objective(self.config.lambda_energy)
-                obj2 = new_sol.compute_objective(self.config.lambda_energy)
-                if obj2 < obj1:
-                    worsening.append(obj1 - obj2)
-        if not worsening:
-            return 100.0
-        avg = sum(worsening)/len(worsening)
-        return max(avg / math.log(1.0/self.config.accept_rate_init), 0.01)
+            op = self.rng.choice(self.d_ops)
+            cand = destroy(inst, start, op, self._q(start), self.rng, cfg.rand_p)
+            cand = repair(inst, cand, self.r_ops[0])
+            f = cand.objective(cfg.eps)
+            if f < f0:
+                worse.append(f0 - f)
+        if not worse:
+            return 1.0
+        return max(sum(worse) / len(worse) / math.log(1.0 / cfg.accept_rate_init), cfg.temp_floor)
 
-    def _accept(self, current_obj, new_obj, best_obj, temp):
-        cfg = self.config
-        if new_obj > best_obj + 1e-9:
-            return True, cfg.sigma1
-        if new_obj > current_obj + 1e-9:
-            return True, cfg.sigma2
-        if temp > 1e-10:
-            delta = new_obj - current_obj
-            if delta < 0 and self.rng.random() < math.exp(delta/temp):
-                return True, cfg.sigma3
-        return False, 0.0
-
-    def solve(self, instance: Instance, verbose=False) -> Tuple[Solution, float, dict]:
-        cfg = self.config
-        start = time.time()
-        current_sol = build_initial_solution(instance, self.rng)
-        best_sol = current_sol.copy()
-        current_obj = current_sol.compute_objective(cfg.lambda_energy)
-        best_obj = current_obj
-        if verbose:
-            print(f"  initial: cov={current_sol.total_coverage:.4f}, E={current_sol.total_energy:.1f}")
-        temp = self._compute_initial_temperature(instance)
-        no_improve = 0
-        it = 0
-        stats = {'iterations': 0, 'best_iteration': 0, 'best_time': 0.0}
+    def solve(self, inst: Instance) -> Tuple[Solution, dict]:
+        cfg, rng = self.cfg, self.rng
+        t0 = time.time()
+        deadline = t0 + cfg.time_limit
+        cur = build_initial(inst, cfg.eps)
+        if cfg.ls_freq > 0:
+            cur = local_search(inst, cur, deadline)
+        best = cur.copy()
+        cur_f = best_f = cur.objective(cfg.eps)
+        init_cov, init_energy = cur.cov, cur.energy
+        temp = self._init_temperature(inst, cur) if cfg.accept == "sa" else 0.0
+        no_imp = 0
+        best_it = 0
+        usage_d = [0] * len(self.d_ops)
+        usage_r = [0] * len(self.r_ops)
+        it = -1
         for it in range(cfg.max_iter):
-            if time.time() - start > cfg.time_limit:
+            if time.time() > deadline:
                 break
-            d_idx = self._select_operator(self.destroy_weights)
-            r_idx = self._select_operator(self.repair_weights)
-            d_op = self.destroy_ops[d_idx][1]
-            r_op = self.repair_ops[r_idx][1]
-
-            n_covered = sum(1 for c in current_sol.covered if c)
-            q = max(1, int(self.rng.uniform(cfg.q_min, cfg.q_max) * max(n_covered, 1)))
-            destroyed, removed = d_op(current_sol, q, self.rng)
-            new_sol = r_op(destroyed, removed, self.rng)
-
-            if it % cfg.local_search_freq == 0:
-                new_sol = LocalSearch.full_local_search(new_sol, self.rng)
-
-            if not new_sol.is_feasible():
-                continue
-
-            new_obj = new_sol.compute_objective(cfg.lambda_energy)
-            accepted, score = self._accept(current_obj, new_obj, best_obj, temp)
-
-            if accepted:
-                current_sol = new_sol
-                current_obj = new_obj
-                if new_obj > best_obj + 1e-9:
-                    best_sol = new_sol.copy()
-                    best_obj = new_obj
-                    no_improve = 0
-                    stats['best_iteration'] = it
-                    stats['best_time'] = time.time() - start
-                    if verbose and (it % 100 == 0):
-                        print(f"    iter {it}: new best obj={best_obj:.6f}, cov={best_sol.total_coverage:.4f}, E={best_sol.total_energy:.1f}")
-                else:
-                    no_improve += 1
+            di = self._roulette(self.d_w)
+            ri = self._roulette(self.r_w)
+            cand = destroy(inst, cur, self.d_ops[di], self._q(cur), rng, cfg.rand_p)
+            cand = repair(inst, cand, self.r_ops[ri])
+            if cfg.ls_freq > 0 and it % cfg.ls_freq == 0:
+                cand = local_search(inst, cand, deadline)
+            f = cand.objective(cfg.eps)
+            if f > best_f + 1e-9:
+                score = cfg.sigma_best
+            elif f > cur_f + 1e-9:
+                score = cfg.sigma_better
             else:
-                no_improve += 1
-
-            self.destroy_scores[d_idx] += score
-            self.repair_scores[r_idx] += score
-            self.destroy_counts[d_idx] += 1
-            self.repair_counts[r_idx] += 1
-
-            if (it+1) % cfg.segment_length == 0:
+                score = cfg.sigma_feasible
+            if f > cur_f + 1e-9:
+                accept = True
+            elif cfg.accept == "sa" and temp > 1e-12:
+                accept = rng.random() < math.exp((f - cur_f) / temp)
+            else:
+                accept = False
+            if accept:
+                cur, cur_f = cand, f
+            if f > best_f + 1e-9:
+                best, best_f = cand.copy(), f
+                best_it = it
+                no_imp = 0
+            else:
+                no_imp += 1
+            self.d_theta[di] += score
+            self.r_theta[ri] += score
+            usage_d[di] += 1
+            usage_r[ri] += 1
+            if (it + 1) % cfg.segment_length == 0:
                 self._update_weights()
-            temp = max(0.001, temp * cfg.cooling_rate)
-            if no_improve >= cfg.max_no_improve:
+            if cfg.accept == "sa":
+                temp = max(cfg.temp_floor, temp * cfg.cooling_rate)
+            if no_imp >= cfg.max_no_improve:
                 break
-        total_time = time.time() - start
-        stats['total_time'] = total_time
-        stats['iterations'] = it+1
-        return best_sol, best_obj, stats
+        stats = {
+            "iterations": it + 1,
+            "best_iteration": best_it,
+            "time_s": time.time() - t0,
+            "init_cov": init_cov,
+            "init_energy": init_energy,
+            "usage_destroy": dict(zip(self.d_ops, usage_d)),
+            "usage_repair": dict(zip(self.r_ops, usage_r)),
+            "weights_destroy": dict(zip(self.d_ops, [round(x, 4) for x in self.d_w])),
+        }
+        return best, stats
 
 
-# ============================================================
-# FONCTIONS DE MULTIPLES RUNS ET STATISTIQUES
-# ============================================================
-def run_multiple(instance_file: str, num_runs: int = 30, config: ALNSConfig = None, verbose=False):
-    if config is None:
-        config = ALNSConfig()
-    instance = load_instance(instance_file)
-    total_weight = sum(instance.target_weights)
+# ======================================================================
+# RUNS, CSV, PARALLELISME
+# ======================================================================
+CSV_FIELDS = ["seed", "coverage_pct", "coverage_weighted", "energy_J", "time_s", "active_drones",
+              "mines_detected", "total_mines", "mines_pct", "all_mines", "iterations", "best_iteration"]
 
-    results = []
-    for seed in range(num_runs):
-        if verbose:
-            print(f"\n--- Run {seed+1}/{num_runs} (seed={seed}) ---")
-        alns = ALNS(config, seed=seed)
-        best_sol, best_obj, stats = alns.solve(instance, verbose=verbose)
-        # Fermer les routes pour obtenir l'énergie finale réelle
-        best_sol.close_all_routes()
-        coverage_pct = (best_sol.total_coverage / total_weight) * 100
-        # Nombre de drones actifs
-        active_drones = sum(1 for r in best_sol.routes if len(r.nodes) > 2)
-        # Mines détectées
-        mines_detected = 0
-        total_mines = 0
-        for t in range(instance.n_targets):
-            if instance.targets[t].get("is_mine", False):
-                total_mines += 1
-                if best_sol.covered[t]:
-                    mines_detected += 1
-        results.append({
-            'seed': seed,
-            'coverage_weighted': best_sol.total_coverage,
-            'coverage_pct': coverage_pct,
-            'energy_J': best_sol.total_energy,
-            'time_s': stats['total_time'],
-            'active_drones': active_drones,
-            'mines_detected': mines_detected,
-            'total_mines': total_mines,
-            'iterations': stats['iterations'],
-            'best_iteration': stats['best_iteration']
-        })
-        if verbose:
-            print(f"  -> coverage={coverage_pct:.2f}%, energy={best_sol.total_energy:.1f}J, time={stats['total_time']:.2f}s")
 
-    # Statistiques
-    cov_vals = [r['coverage_pct'] for r in results]
-    energy_vals = [r['energy_J'] for r in results]
-    time_vals = [r['time_s'] for r in results]
-    drones_vals = [r['active_drones'] for r in results]
-    mines_vals = [r['mines_detected'] for r in results]
-
-    stats_summary = {
-        'instance': os.path.basename(instance_file),
-        'num_runs': num_runs,
-        'coverage_mean': np.mean(cov_vals),
-        'coverage_std': np.std(cov_vals),
-        'coverage_min': np.min(cov_vals),
-        'coverage_max': np.max(cov_vals),
-        'energy_mean': np.mean(energy_vals),
-        'energy_std': np.std(energy_vals),
-        'energy_min': np.min(energy_vals),
-        'energy_max': np.max(energy_vals),
-        'time_mean': np.mean(time_vals),
-        'time_std': np.std(time_vals),
-        'time_min': np.min(time_vals),
-        'time_max': np.max(time_vals),
-        'drones_mean': np.mean(drones_vals),
-        'drones_std': np.std(drones_vals),
-        'mines_success_rate': np.mean([1 if m == results[0]['total_mines'] else 0 for m in mines_vals]) * 100 if results[0]['total_mines'] > 0 else None,
+def run_one(task):
+    path, seed, cfg, save_dir = task
+    inst = load_instance(path)
+    best, st = ALNS(cfg, seed).solve(inst)
+    cov, en = validate(inst, best)
+    total_mines = sum(1 for u in inst.targets() if inst.is_mine[u])
+    detected = sum(1 for u in inst.targets() if inst.is_mine[u] and best.visited[u])
+    row = {
+        "seed": seed,
+        "coverage_pct": 100.0 * cov / inst.total_weight,
+        "coverage_weighted": cov,
+        "energy_J": en,
+        "time_s": st["time_s"],
+        "active_drones": sum(1 for r in best.routes if r),
+        "mines_detected": detected,
+        "total_mines": total_mines,
+        "mines_pct": (100.0 * detected / total_mines) if total_mines > 0 else "",
+        "all_mines": (1 if detected == total_mines else 0) if total_mines > 0 else "",
+        "iterations": st["iterations"],
+        "best_iteration": st["best_iteration"],
     }
-    return results, stats_summary
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        name = os.path.splitext(os.path.basename(path))[0]
+        with open(os.path.join(save_dir, "%s_seed%d.json" % (name, seed)), "w") as f:
+            json.dump({"instance": inst.name, "seed": seed, "objective": best.objective(cfg.eps),
+                       "routes": explicit_routes(best), "stats": st}, f)
+    return path, row
 
 
-def print_summary(stats_summary):
-    print("\n" + "="*60)
-    print(f"STATISTIQUES SUR {stats_summary['num_runs']} RUNS - {stats_summary['instance']}")
-    print("="*60)
-    print(f"Couverture (%): moyenne={stats_summary['coverage_mean']:.2f}, std={stats_summary['coverage_std']:.3f}, min={stats_summary['coverage_min']:.2f}, max={stats_summary['coverage_max']:.2f}")
-    print(f"Énergie (J): moyenne={stats_summary['energy_mean']:.1f}, std={stats_summary['energy_std']:.1f}, min={stats_summary['energy_min']:.1f}, max={stats_summary['energy_max']:.1f}")
-    print(f"Temps (s): moyenne={stats_summary['time_mean']:.2f}, std={stats_summary['time_std']:.2f}, min={stats_summary['time_min']:.2f}, max={stats_summary['time_max']:.2f}")
-    print(f"Drones actifs: moyenne={stats_summary['drones_mean']:.2f}, std={stats_summary['drones_std']:.3f}")
-    if stats_summary['mines_success_rate'] is not None:
-        print(f"Mines détectées: {stats_summary['mines_success_rate']:.1f}% des runs (toutes les mines)")
-    print("="*60)
+def _read_done(csv_path: str) -> Dict[int, dict]:
+    done = {}
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", newline="") as f:
+            for r in csv.DictReader(f):
+                try:
+                    done[int(r["seed"])] = r
+                except (KeyError, ValueError):
+                    pass
+    return done
 
 
-def save_results_csv(results, filename):
-    with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['seed', 'coverage_pct', 'energy_J', 'time_s', 'active_drones', 'mines_detected', 'total_mines', 'iterations', 'best_iteration']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            writer.writerow({k: r[k] for k in fieldnames})
+def run_batch(paths: List[str], runs: int, cfg: Config, out_dir: str, workers: int,
+              resume: bool, save_dir: Optional[str]):
+    os.makedirs(out_dir, exist_ok=True)
+    tasks, csv_paths, done = [], {}, {}
+    for p in paths:
+        name = os.path.splitext(os.path.basename(p))[0]
+        cp = os.path.join(out_dir, "alns_stats_%s.csv" % name)
+        csv_paths[p] = cp
+        d = _read_done(cp) if resume else {}
+        done[p] = d
+        if not resume or not d:
+            with open(cp, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+        for s in range(runs):
+            if s not in d:
+                tasks.append((p, s, cfg, save_dir))
+    print("%d instances, %d runs a executer, %d workers" % (len(paths), len(tasks), workers), flush=True)
+    t0 = time.time()
+    with Pool(workers) as pool:
+        for n, (p, row) in enumerate(pool.imap_unordered(run_one, tasks), 1):
+            with open(csv_paths[p], "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(row)
+            if n % 10 == 0 or n == len(tasks):
+                print("  %d/%d runs (%.0f s)" % (n, len(tasks), time.time() - t0), flush=True)
+    print("Termine en %.1f s. CSV dans %s" % (time.time() - t0, out_dir))
 
 
-# ============================================================
-# MAIN
-# ============================================================
-def main():
-    # Chercher le premier argument qui ne commence pas par '-'
-    instance_file = None
-    for arg in sys.argv[1:]:
-        if not arg.startswith('-'):
-            instance_file = arg
-            break
-    if instance_file is None:
-        instance_file = "instance_advanced_0.json"  # fichier par défaut
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="ALNS MDDMRP-DF")
+    ap.add_argument("instances", nargs="+", help="fichiers JSON ou dossier(s)")
+    ap.add_argument("--runs", type=int, default=30)
+    ap.add_argument("--out", default="results_alns")
+    ap.add_argument("--workers", type=int, default=max(1, cpu_count() - 1))
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--save-solutions", default=None, help="dossier de sortie des routes (JSON)")
+    ap.add_argument("--time-limit", type=float, default=300.0)
+    ap.add_argument("--max-iter", type=int, default=5000)
+    ap.add_argument("--max-no-improve", type=int, default=500)
+    ap.add_argument("--q-max", type=float, default=0.30)
+    ap.add_argument("--eps", type=float, default=1e-7)
+    ap.add_argument("--accept", choices=["sa", "descent"], default="sa")
+    ap.add_argument("--ls-freq", type=int, default=1, help="0 = sans recherche locale")
+    ap.add_argument("--rand-p", type=float, default=4.0, help="<=0 : classement deterministe")
+    ap.add_argument("--destroy", default="random,worst,cluster,current")
+    ap.add_argument("--repair", default="greedy", help="greedy[,regret2]")
+    ap.add_argument("--no-adaptive", action="store_true")
+    args, _ = ap.parse_known_args(argv)
+    return args
 
-    num_runs = 20
-    config = ALNSConfig(
-        max_iter=5000,
-        time_limit=300,
-        q_min=0.05,
-        q_max=0.25,
-        local_search_freq=50,
-        lambda_energy=1e-7,
-    )
 
-    print(f"Lancement de {num_runs} runs pour {instance_file}...")
-    results, stats = run_multiple(instance_file, num_runs=num_runs, config=config, verbose=True)
-    print_summary(stats)
+def main(argv=None):
+    a = parse_args(argv)
+    paths = []
+    for x in a.instances:
+        if os.path.isdir(x):
+            paths += sorted(glob.glob(os.path.join(x, "instance_*.json")))
+        else:
+            paths.append(x)
+    cfg = Config(max_iter=a.max_iter, max_no_improve=a.max_no_improve, time_limit=a.time_limit,
+                 q_max=a.q_max, eps=a.eps, accept=a.accept, ls_freq=a.ls_freq,
+                 rand_p=(a.rand_p if a.rand_p > 0 else None),
+                 destroy_ops=tuple(a.destroy.split(",")), repair_ops=tuple(a.repair.split(",")),
+                 adaptive=not a.no_adaptive)
+    run_batch(paths, a.runs, cfg, a.out, a.workers, a.resume, a.save_solutions)
 
-    csv_name = f"alns_stats_{os.path.basename(instance_file).replace('.json', '')}.csv"
-    save_results_csv(results, csv_name)
-    print(f"\nRésultats détaillés sauvegardés dans {csv_name}")
 
 if __name__ == "__main__":
-    # Définissez ici le chemin vers votre fichier JSON d'instance
-    instance_file = "instance_200_8.json"   # MODIFIEZ ICI
-    if not os.path.exists(instance_file):
-        print(f"Fichier {instance_file} non trouvé. Assurez-vous qu'il est dans le répertoire courant.")
-        sys.exit(1)
-
-    num_runs = 20
-    config = ALNSConfig(
-        max_iter=5000,
-        time_limit=300,
-        q_min=0.05,
-        q_max=0.25,
-        local_search_freq=50,
-        lambda_energy=1e-7,
-    )
-    print(f"Lancement de {num_runs} runs pour {instance_file}...")
-    results, stats = run_multiple(instance_file, num_runs=num_runs, config=config, verbose=True)
-    print_summary(stats)
-    csv_name = f"alns_stats_{os.path.basename(instance_file).replace('.json', '')}.csv"
-    save_results_csv(results, csv_name)
-    print(f"\nRésultats détaillés sauvegardés dans {csv_name}")
+    main()
