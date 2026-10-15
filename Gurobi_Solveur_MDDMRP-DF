@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# %% [CELLULE 1] - Installation de gurobipy (a executer a chaque nouvelle session Colab)
+# -----------------------------------------------------------------------------
+# Decommentez et executez cette cellule en premier dans Colab :
+#
+# !pip install gurobipy
+#
+# gurobipy embarque automatiquement une licence gratuite "Size-Limited Trial"
+# (max 2000 variables / 2000 contraintes). Aucune activation ni fichier
+# gurobi.lic n'est necessaire pour une instance de cette taille.
+# Vous verrez le message suivant au premier appel a gp.Model() :
+#   "Restricted license - for non-production use only - expires AAAA-MM-JJ"
+
+# %% [CELLULE 2] - Upload du fichier d'instance JSON
+# -----------------------------------------------------------------------------
+# Le systeme de fichiers de Colab est ephemere : il faut uploader le fichier
+# a chaque session (ou le monter depuis Google Drive, voir note en bas).
+#
+# from google.colab import files
+# uploaded = files.upload()  # une fenetre s'ouvre pour choisir instance_advanced_7.json
+# json_filename = list(uploaded.keys())[0]
+#
+# Alternative via Google Drive (pour eviter de re-uploader a chaque session) :
+# from google.colab import drive
+# drive.mount('/content/drive')
+# json_filename = "/content/drive/MyDrive/chemin/vers/instance_advanced_7.json"
+
+# %% [CELLULE 3] - Imports et definitions (inchange par rapport a votre script original)
+# -----------------------------------------------------------------------------
+import json
+import gurobipy as gp
+from gurobipy import GRB
+
+
+def find_subtours(arcs, nodes):
+    unvisited = set(nodes)
+    subtours = []
+    while unvisited:
+        current = unvisited.pop()
+        stack = [current]
+        comp = {current}
+        while stack:
+            i = stack.pop()
+            for (u, v) in arcs:
+                if u == i and v not in comp:
+                    comp.add(v)
+                    stack.append(v)
+                if v == i and u not in comp:
+                    comp.add(u)
+                    stack.append(u)
+        subtours.append(comp)
+        unvisited -= comp
+    return subtours
+
+
+def subtour_callback(model, where):
+    if where == GRB.Callback.MIPSOL:
+        x = model._x
+        nodes = model._nodes
+        depots = model._depots
+        drones = model._drones
+        S = model._S
+
+        for k in drones:
+            arcs = []
+            for i in nodes:
+                for j in nodes:
+                    if i == j:
+                        continue
+                    for s in range(S):
+                        if model.cbGetSolution(x[i, j, s, k]) > 0.5:
+                            arcs.append((i, j))
+                            break
+            if not arcs:
+                continue
+            subtours = find_subtours(arcs, nodes)
+            for comp in subtours:
+                if not any(d in comp for d in depots) and len(comp) > 1:
+                    model.cbLazy(
+                        gp.quicksum(x[i, j, s, k] for i in comp for j in comp if i != j for s in range(S))
+                        <= len(comp) - 1
+                    )
+
+
+# %% [CELLULE 4] - Fonction principale de resolution
+# -----------------------------------------------------------------------------
+def solve_instance(json_file, time_limit=60, energy_penalty=1e-5):
+    with open(json_file, "r") as f:
+        data = json.load(f)
+
+    depots = data["depots"]
+    targets = data["targets"]
+    drones_data = data["drones"]
+    speeds = data["drone_speeds"]
+    time_matrices = data["time_matrices"]
+    energy_matrices = data["energy_matrices"]
+    sensor_power = data["sensor_power"]
+
+    n_depots = len(depots)
+    n_targets = len(targets)
+    N = n_depots + n_targets
+    K = len(drones_data)
+    S = len(speeds)
+
+    # Note Colab : si vous passez a une plus grande instance (Large 150/200),
+    # le nombre de variables depassera 2000 et il faudra alors une licence WLS
+    # academique complete.
+    model = gp.Model("MDDMRP-Advanced")
+    model.setParam("TimeLimit", time_limit)
+    model.setParam("MIPGap", 0.01)
+    model.setParam("LazyConstraints", 1)
+
+    x = model.addVars(N, N, S, K, vtype=GRB.BINARY, name="x")
+    y = model.addVars(N, K, vtype=GRB.BINARY, name="y")
+    z = model.addVars(K, vtype=GRB.BINARY, name="z")
+    r = model.addVars(n_depots, K, vtype=GRB.BINARY, name="r")
+
+    coverage = gp.quicksum(targets[j]["weight"] * y[n_depots + j, k]
+                            for j in range(n_targets) for k in range(K))
+    total_energy = gp.quicksum(energy_matrices[s][i][j] * x[i, j, s, k]
+                                for i in range(N) for j in range(N) if i != j
+                                for s in range(S) for k in range(K)) \
+        + gp.quicksum(sensor_power * targets[j]["duration"] * y[n_depots + j, k]
+                      for j in range(n_targets) for k in range(K))
+    model.setObjective(coverage - energy_penalty * total_energy, GRB.MAXIMIZE)
+
+    for j in range(n_targets):
+        model.addConstr(gp.quicksum(y[n_depots + j, k] for k in range(K)) <= 1, name=f"unique_{j}")
+
+    for k in range(K):
+        for j in range(n_depots, N):
+            inflow = gp.quicksum(x[i, j, s, k] for i in range(N) if i != j for s in range(S))
+            outflow = gp.quicksum(x[j, i, s, k] for i in range(N) if i != j for s in range(S))
+            model.addConstr(inflow == y[j, k], name=f"fin_{k}_{j}")
+            model.addConstr(outflow == y[j, k], name=f"fout_{k}_{j}")
+
+    for k in range(K):
+        start = drones_data[k]["start_depot"]
+        model.addConstr(gp.quicksum(x[start, j, s, k] for j in range(N) if j != start for s in range(S)) == z[k], name=f"depart_{k}")
+        model.addConstr(y[start, k] == z[k], name=f"y_depart_{k}")
+
+    for k in range(K):
+        model.addConstr(gp.quicksum(r[d, k] for d in range(n_depots)) == z[k], name=f"arrivee_sum_{k}")
+        for d in range(n_depots):
+            inbound = gp.quicksum(x[i, d, s, k] for i in range(N) if i != d for s in range(S))
+            model.addConstr(inbound == r[d, k], name=f"arrivee_{k}_{d}")
+
+    for k in range(K):
+        for d1 in range(n_depots):
+            for d2 in range(n_depots):
+                if d1 != d2:
+                    for s in range(S):
+                        model.addConstr(x[d1, d2, s, k] == 0, name=f"nodep_{k}_{d1}_{d2}")
+
+    for k in range(K):
+        for i in range(N):
+            for j in range(N):
+                if i != j:
+                    for s in range(S):
+                        model.addConstr(x[i, j, s, k] <= y[i, k], name=f"xley_i_{k}_{i}_{j}")
+                        model.addConstr(x[i, j, s, k] <= y[j, k], name=f"xley_j_{k}_{i}_{j}")
+
+    for k in range(K):
+        Emax = drones_data[k]["E_max"]
+        E_prop = gp.quicksum(energy_matrices[s][i][j] * x[i, j, s, k]
+                              for i in range(N) for j in range(N) if i != j for s in range(S))
+        E_sens = gp.quicksum(sensor_power * targets[j]["duration"] * y[n_depots + j, k]
+                              for j in range(n_targets))
+        model.addConstr(E_prop + E_sens <= Emax, name=f"energy_{k}")
+
+    for k in range(K):
+        Hmax = drones_data[k]["H_max"]
+        for j in range(n_targets):
+            if abs(targets[j]["z"]) > Hmax:
+                model.addConstr(y[n_depots + j, k] == 0, name=f"depth_{k}_{j}")
+
+    for k in range(K):
+        model.addConstr(z[k] <= gp.quicksum(y[n_depots + j, k] for j in range(n_targets)), name=f"active_min_{k}")
+
+    INF = 1e8
+    for i in range(N):
+        for j in range(N):
+            if i != j:
+                for s in range(S):
+                    if time_matrices[s][i][j] >= INF:
+                        for k in range(K):
+                            model.addConstr(x[i, j, s, k] == 0, name=f"inf_{i}_{j}_{s}_{k}")
+
+    model._x = x
+    model._nodes = list(range(N))
+    model._depots = list(range(n_depots))
+    model._drones = list(range(K))
+    model._S = S
+
+    model.optimize(subtour_callback)
+
+    if model.Status in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
+        print("\n--- Resultats detailles ---")
+        routes, speeds_used, end_depots, covered_targets = [], [], [], []
+
+        for k in range(K):
+            if z[k].X < 0.5:
+                routes.append([]); speeds_used.append([]); end_depots.append(None); covered_targets.append([])
+                continue
+            start = drones_data[k]["start_depot"]
+            route = [start]
+            speed_profile = []
+            current = start
+            while True:
+                nxt = None
+                chosen_s = None
+                for j in range(N):
+                    if j == current:
+                        continue
+                    for s in range(S):
+                        if x[current, j, s, k].X > 0.5:
+                            nxt = j; chosen_s = s; break
+                    if nxt is not None:
+                        break
+                if nxt is None:
+                    break
+                route.append(nxt)
+                speed_profile.append(chosen_s)
+                current = nxt
+                if current < n_depots:
+                    break
+            routes.append(route)
+            speeds_used.append(speed_profile)
+            end = None
+            for d in range(n_depots):
+                if r[d, k].X > 0.5:
+                    end = d; break
+            end_depots.append(end)
+            covered = [j - n_depots for j in route if j >= n_depots]
+            covered_targets.append(covered)
+
+        total_energy_val = 0.0
+        total_coverage = 0.0
+        for k in range(K):
+            if not routes[k]:
+                print(f"Drone {k}: INACTIF")
+                continue
+            e_prop = sum(energy_matrices[speeds_used[k][idx]][routes[k][idx]][routes[k][idx + 1]]
+                         for idx in range(len(routes[k]) - 1))
+            e_sens = sensor_power * sum(targets[c]["duration"] for c in covered_targets[k])
+            e_total = e_prop + e_sens
+            total_energy_val += e_total
+            total_coverage += sum(targets[c]["weight"] for c in covered_targets[k])
+            remaining = drones_data[k]["E_max"] - e_total
+            print(f"Drone {k} (depot {drones_data[k]['start_depot']} -> depot {end_depots[k]}): "
+                  f"energie {e_total:.1f} J, restante {remaining:.1f} J ({remaining/drones_data[k]['E_max']*100:.1f}%)")
+            vit_str = " -> ".join([f"{speeds[s]} m/s" for s in speeds_used[k]])
+            print(f"   Vitesses: {vit_str}")
+
+        # --- Statistiques finales : protegees contre les divisions par zero ---
+        mines_detected = sum(1 for cells in covered_targets for c in cells if targets[c]["is_mine"])
+        total_mines = sum(1 for t in targets if t["is_mine"])
+        total_weight = sum(t["weight"] for t in targets)
+
+        print("\n" + "=" * 60)
+        print("RESULTAT FINAL")
+        print("=" * 60)
+        print(f"Statut: {'OPTIMAL' if model.Status == GRB.OPTIMAL else 'TIME_LIMIT'}")
+        print(f"Objectif (couverture - eps*energie): {model.ObjVal:.6f}")
+
+        if total_weight > 0:
+            print(f"Couverture ponderee: {total_coverage:.4f} / {total_weight:.4f} "
+                  f"({total_coverage / total_weight * 100:.1f}%)")
+        else:
+            print(f"Couverture ponderee: {total_coverage:.4f} / {total_weight:.4f} "
+                  "(somme des poids nulle, pourcentage non defini)")
+
+        print(f"Energie totale consommee: {total_energy_val:.1f} J")
+
+        if total_mines > 0:
+            print(f"Mines detectees: {mines_detected}/{total_mines} "
+                  f"({mines_detected / total_mines * 100:.1f}%)")
+        else:
+            print("Mines detectees: aucune mine presente dans cette instance "
+                  "(is_mine=False pour toutes les cibles)")
+
+        # --- Bloc restaure : detail des routes par drone ---
+        print("\nRoutes detaillees :")
+        for k in range(K):
+            if not routes[k]:
+                print(f"  Drone {k}: INACTIF")
+                continue
+            route_str = f"  Drone {k}: Depot {routes[k][0]}"
+            for idx in range(1, len(routes[k])):
+                node = routes[k][idx]
+                if node < n_depots:
+                    route_str += f" -> Depot {node}"
+                else:
+                    route_str += f" -> Cible {node - n_depots}"
+                if idx - 1 < len(speeds_used[k]):
+                    route_str += f" [{speeds[speeds_used[k][idx - 1]]} m/s]"
+            print(route_str)
+
+        print("=" * 60)
+        return model.ObjVal
+    else:
+        print(f"Probleme : statut Gurobi {model.Status}")
+        if model.Status == GRB.INFEASIBLE:
+            model.computeIIS()
+            model.write("infeasible.ilp")
+        return None
+
+
+# %% [CELLULE 5] - Execution (a lancer apres avoir uploade le fichier en cellule 2)
+# -----------------------------------------------------------------------------
+# json_filename a ete defini en cellule 2 ; en execution locale on utilise le nom direct
+if __name__ == "__main__":
+    solve_instance("instance_advanced_7.json", time_limit=60, energy_penalty=1e-8)
