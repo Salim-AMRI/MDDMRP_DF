@@ -53,6 +53,17 @@ Two solution methods are provided:
 - NumPy
 - (Optional) Gurobi 13.0 for the exact MILP solver
 
+## Computational environment
+
+All results reported in the paper were obtained on Google Colab's
+free tier:
+
+- **CPU**: Intel Xeon @ 2.20 GHz (2 vCPUs)
+- **RAM**: 12.7 GB
+- **OS**: Ubuntu 22.04 (Linux 6.6.122+)
+- **Python**: 3.13.16
+- **No GPU**: All experiments CPU-only
+
 ### Install dependencies
 
 ```bash
