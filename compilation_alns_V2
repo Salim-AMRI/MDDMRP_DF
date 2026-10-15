@@ -1,0 +1,185 @@
+import subprocess
+import os
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+INSTANCES = [f"instance_advanced_{i}.json" for i in range(10)]  # 0..9
+RUNS = 30
+TIME_LIMIT = 300
+MAX_ITER = 5000
+
+configs = [
+    ("full",        []),
+    ("no_ls",       ["--ls-freq", "0"]),
+    ("random_only", ["--destroy", "random"]),
+    ("no_adaptive", ["--no-adaptive"]),
+    ("greedy",      ["--accept", "descent"]),
+]
+
+# ============================================================
+# BOUCLE
+# ============================================================
+for inst in INSTANCES:
+    inst_stem = inst.replace(".json", "")
+    print(f"\n{'#'*70}")
+    print(f"# Instance : {inst}")
+    print(f"{'#'*70}", flush=True)
+
+    for cfg_name, extra in configs:
+        out_dir = f"results_abl_small_{cfg_name}"
+        os.makedirs(out_dir, exist_ok=True)
+
+        cmd = ["python", "alns_v2.py", inst,
+               "--runs", str(RUNS),
+               "--max-iter", str(MAX_ITER),
+               "--time-limit", str(TIME_LIMIT),
+               "--resume",
+               "--out", out_dir] + extra
+
+        print(f"\n--- {cfg_name} ({inst_stem}) ---", flush=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        print(r.stdout.strip(), flush=True)
+        if r.stderr:
+            print("STDERR:", r.stderr.strip()[:500], flush=True)
+
+import pandas as pd
+import os
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+INSTANCES = [f"instance_advanced_{i}" for i in range(10)] 
+
+configs_map = [
+    ("Full ALNS",             "full"),
+    ("Sans local search",     "no_ls"),
+    ("Random only",           "random_only"),
+    ("Sans adaptatif",        "no_adaptive"),
+    ("Acceptation gloutonne", "greedy"),
+]
+
+# ============================================================
+# TABLEAU PAR INSTANCE
+# ============================================================
+for inst_stem in INSTANCES:
+    print(f"\n{'='*88}")
+    print(f"INSTANCE : {inst_stem}")
+    print(f"{'='*88}")
+    print(f"{'Config':<25} {'Runs':>5} {'Cov. moy':>10} {'Cov. std':>10} "
+          f"{'Cov. min':>10} {'E. moy':>12} {'t moy':>8}")
+    print("-" * 88)
+
+    for name, folder_suffix in configs_map:
+        folder = f"results_abl_small_{folder_suffix}"
+        path = f"{folder}/alns_stats_{inst_stem}.csv"
+
+        if not os.path.exists(path):
+            print(f"{name:<25} {'MANQUANT':>5}")
+            continue
+        df = pd.read_csv(path)
+        if len(df) == 0:
+            print(f"{name:<25} {'VIDE':>5}")
+            continue
+        print(f"{name:<25} "
+              f"{len(df):>5d} "
+              f"{df['coverage_pct'].mean():>10.2f} "
+              f"{df['coverage_pct'].std():>10.3f} "
+              f"{df['coverage_pct'].min():>10.2f} "
+              f"{df['energy_J'].mean():>12.0f} "
+              f"{df['time_s'].mean():>8.2f}")
+
+# ============================================================
+# RÉSUMÉ AGRÉGÉ SUR TOUTES LES INSTANCES
+# ============================================================
+print(f"\n\n{'#'*88}")
+print("RÉSUMÉ AGRÉGÉ — 10 instances × 30 runs × 5 configurations")
+print(f"{'#'*88}\n")
+
+summary_rows = []
+for name, folder_suffix in configs_map:
+    folder = f"results_abl_small_{folder_suffix}"
+    if not os.path.isdir(folder):
+        continue
+
+    covs, energies, times = [], [], []
+    for inst_stem in INSTANCES:
+        path = f"{folder}/alns_stats_{inst_stem}.csv"
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            if len(df) > 0:
+                covs.append(df["coverage_pct"].mean())
+                energies.append(df["energy_J"].mean())
+                times.append(df["time_s"].mean())
+
+    if covs:
+        summary_rows.append({
+            "config": name,
+            "n_instances": len(covs),
+            "cov_mean": sum(covs) / len(covs),
+            "cov_std_across_inst": pd.Series(covs).std(),
+            "cov_min": min(covs),
+            "cov_max": max(covs),
+            "energy_mean": sum(energies) / len(energies),
+            "time_mean": sum(times) / len(times),
+        })
+
+df_summary = pd.DataFrame(summary_rows)
+
+print(f"{'Config':<25} {'Inst.':>5} {'Cov. moy':>10} {'σ(inst)':>9} "
+      f"{'Cov. min':>10} {'Cov. max':>10} {'E. moy':>12} {'t moy':>8}")
+print("-" * 100)
+for _, r in df_summary.iterrows():
+    print(f"{r['config']:<25} "
+          f"{int(r['n_instances']):>5d} "
+          f"{r['cov_mean']:>10.3f} "
+          f"{r['cov_std_across_inst']:>9.3f} "
+          f"{r['cov_min']:>10.2f} "
+          f"{r['cov_max']:>10.2f} "
+          f"{r['energy_mean']:>12.0f} "
+          f"{r['time_mean']:>8.2f}")
+
+# Sauvegarder
+df_summary.to_csv("results_abl_small_0_9_summary.csv", index=False)
+print("\n📊 Résumé sauvegardé : results_abl_small_0_9_summary.csv")
+
+import pandas as pd
+import os
+
+INSTANCES = [f"instance_advanced_{i}" for i in range(10)]
+
+configs_map = {
+    "Full ALNS":             "full",
+    "Sans local search":     "no_ls",
+    "Random only":           "random_only",
+    "Sans adaptatif":        "no_adaptive",
+    "Acceptation gloutonne": "greedy",
+}
+
+# Construction de la matrice
+matrix = {}
+for name, folder_suffix in configs_map.items():
+    row = {}
+    for inst_stem in INSTANCES:
+        path = f"results_abl_small_{folder_suffix}/alns_stats_{inst_stem}.csv"
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            if len(df) > 0:
+                row[inst_stem.replace("instance_advanced_", "Ins_")] = \
+                    df["coverage_pct"].mean()
+    matrix[name] = row
+
+df_matrix = pd.DataFrame(matrix).T
+print("\n" + "="*100)
+print("COUVERTURE (%) PAR INSTANCE ET PAR CONFIGURATION")
+print("="*100)
+print(df_matrix.round(2).to_string())
+
+# Écart vs Full ALNS
+if "Full ALNS" in df_matrix.index:
+    baseline = df_matrix.loc["Full ALNS"]
+    diff = df_matrix - baseline
+    print("\n" + "="*100)
+    print("ÉCART vs Full ALNS (points de pourcentage)")
+    print("="*100)
+    print(diff.round(3).to_string())
