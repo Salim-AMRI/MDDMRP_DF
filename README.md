@@ -39,10 +39,6 @@ Two solution methods are provided:
 ├── code/                    # Python source code
 │   └── alns_v2.py          # ALNS solver (main file)
 ├── instances/               # Benchmark instances (JSON)
-├── results/                 # Raw experimental results
-│   ├── summary_ALNS.csv    # Aggregated results
-│   └── solutions/          # Optimal routes (JSON)
-├── figures/                 # Figures from the paper
 ├── docs/                    # Additional documentation
 ├── README.md
 └── requirements.txt
@@ -204,6 +200,10 @@ python alns_v2.py ../instances/instance_150_5.json \
 ```
 
 Repeat the same commands for `instance_200_9.json`.
+
+## Results
+
+Link of the different results : https://drive.google.com/file/d/1trY84SzLZf8iQ7sCOImfHAP1_5SP8vVZ/view?usp=sharing
 
 ## Instance format
 
