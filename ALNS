@@ -92,6 +92,7 @@ class Instance:
 
     def __init__(self, data: dict, name: str = ""):
         self.name = name
+        self.fixed_return = bool(data.get("fixed_return", False))
         depots, targets, drones = data["depots"], data["targets"], data["drones"]
         self.nd, self.nt = len(depots), len(targets)
         self.n = self.nd + self.nt
@@ -174,6 +175,13 @@ def load_instance(path: str) -> Instance:
 # ======================================================================
 # SOLUTION
 # ======================================================================
+def ret_cost(inst, k, u):
+    """Energie de retour depuis u pour le drone k (FR = start depot, FM = min depots)."""
+    if getattr(inst, "fixed_return", False):
+        return inst.c[u][inst.start[k]]
+    return inst.ret[u]
+
+
 def route_energy(inst: Instance, k: int, r: List[int]) -> float:
     """Energie fermee (arcs + retour + capteurs) d'une route de cibles."""
     if not r:
@@ -182,7 +190,7 @@ def route_energy(inst: Instance, k: int, r: List[int]) -> float:
     e = c[inst.start[k]][r[0]]
     for a, b in zip(r, r[1:]):
         e += c[a][b]
-    e += inst.ret[r[-1]]
+    e += ret_cost(inst, k, r[-1])
     sens = inst.sens
     for x in r:
         e += sens[x]
@@ -231,48 +239,45 @@ class Solution:
         return sum(len(r) for r in self.routes)
 
 
-# ======================================================================
-# DELTAS D'ENERGIE (exacts, O(1))
-# ======================================================================
 def ins_delta(inst: Instance, k: int, r: List[int], pos: int, u: int) -> float:
     """Variation d'energie fermee en inserant u a l'indice pos de r (capteur inclus)."""
-    c, ret = inst.c, inst.ret
+    c = inst.c
     if not r:
-        return c[inst.start[k]][u] + ret[u] + inst.sens[u]
+        return c[inst.start[k]][u] + ret_cost(inst, k, u) + inst.sens[u]
     if pos == 0:
         s, nx = inst.start[k], r[0]
         return c[s][u] + c[u][nx] - c[s][nx] + inst.sens[u]
     pv = r[pos - 1]
     if pos == len(r):
-        return c[pv][u] + ret[u] - ret[pv] + inst.sens[u]
+        return c[pv][u] + ret_cost(inst, k, u) - ret_cost(inst, k, pv) + inst.sens[u]
     nx = r[pos]
     return c[pv][u] + c[u][nx] - c[pv][nx] + inst.sens[u]
 
 
 def rem_delta(inst: Instance, k: int, r: List[int], pos: int) -> float:
     """Variation d'energie fermee en retirant r[pos] (capteur inclus ; <= 0 en general)."""
-    c, ret = inst.c, inst.ret
+    c = inst.c
     u = r[pos]
     n = len(r)
     if n == 1:
-        return -(c[inst.start[k]][u] + ret[u] + inst.sens[u])
+        return -(c[inst.start[k]][u] + ret_cost(inst, k, u) + inst.sens[u])
     if pos == 0:
         s, nx = inst.start[k], r[1]
         return c[s][nx] - c[s][u] - c[u][nx] - inst.sens[u]
     pv = r[pos - 1]
     if pos == n - 1:
-        return ret[pv] - c[pv][u] - ret[u] - inst.sens[u]
+        return ret_cost(inst, k, pv) - c[pv][u] - ret_cost(inst, k, u) - inst.sens[u]
     nx = r[pos + 1]
     return c[pv][nx] - c[pv][u] - c[u][nx] - inst.sens[u]
 
 
 def repl_delta(inst: Instance, k: int, r: List[int], pos: int, v: int) -> float:
     """Variation d'energie en remplacant r[pos] par v (capteurs inclus)."""
-    c, ret = inst.c, inst.ret
+    c = inst.c
     u = r[pos]
     pv = inst.start[k] if pos == 0 else r[pos - 1]
     if pos == len(r) - 1:
-        d = c[pv][v] + ret[v] - c[pv][u] - ret[u]
+        d = c[pv][v] + ret_cost(inst, k, v) - c[pv][u] - ret_cost(inst, k, u)
     else:
         nx = r[pos + 1]
         d = c[pv][v] + c[v][nx] - c[pv][u] - c[u][nx]
@@ -287,7 +292,7 @@ def depth_ok(inst: Instance, k: int, u: int) -> bool:
 # RECHERCHE LOCALE (2-opt, relocate, exchange ; premiere amelioration)
 # ======================================================================
 def two_opt(inst: Instance, sol: Solution) -> bool:
-    c, ret = inst.c, inst.ret
+    c = inst.c
     improved_any = False
     for k in range(inst.K):
         r = sol.routes[k]
@@ -310,14 +315,14 @@ def two_opt(inst: Instance, sol: Solution) -> bool:
                         removed = c[a][vi] + (Fp[j] - Fp[i]) + c[vj][nx]
                         added = c[a][vj] + (Rp[j] - Rp[i]) + c[vi][nx]
                     else:
-                        removed = c[a][vi] + (Fp[j] - Fp[i]) + ret[vj]
-                        added = c[a][vj] + (Rp[j] - Rp[i]) + ret[vi]
+                        removed = c[a][vi] + (Fp[j] - Fp[i]) + ret_cost(inst, k, vj)
+                        added = c[a][vj] + (Rp[j] - Rp[i]) + ret_cost(inst, k, vi)
                     d = added - removed
                     if d < -1e-9 and sol.re[k] + d <= inst.E[k] + TOL:
                         r[i - 1:j] = r[i - 1:j][::-1]
                         old = sol.re[k]
                         sol.touch(k)
-                        if sol.re[k] >= old - 1e-9:      # garde-fou (ne doit pas arriver)
+                        if sol.re[k] >= old - 1e-9:
                             r[i - 1:j] = r[i - 1:j][::-1]
                             sol.touch(k)
                             continue
@@ -603,7 +608,11 @@ def explicit_routes(sol: Solution) -> List[dict]:
     for k, r in enumerate(sol.routes):
         if not r:
             continue
-        nodes = [inst.start[k]] + r + [inst.ret_depot[r[-1]]]
+        if getattr(inst, "fixed_return", False):
+            return_depot = inst.start[k]
+        else:
+            return_depot = inst.ret_depot[r[-1]]
+        nodes = [inst.start[k]] + r + [return_depot]
         speeds = [inst.sp[a][b] for a, b in zip(nodes, nodes[1:])]
         out.append({"drone": k, "nodes": nodes, "speeds": speeds})
     return out
@@ -772,10 +781,47 @@ CSV_FIELDS = ["seed", "coverage_pct", "coverage_weighted", "energy_J", "time_s",
               "mines_detected", "total_mines", "mines_pct", "all_mines", "iterations", "best_iteration"]
 
 
+def _load_fr_warmstart(inst, seed):
+    """Charge la meilleure solution FR sauvegardee et la reevalue en FM.
+    Retourne None si instance FR, si aucune solution FR n'existe,
+    ou si la solution n'est pas faisable dans l'instance cible."""
+    if getattr(inst, "fixed_return", False):
+        return None
+    base = os.path.splitext(inst.name)[0]
+    cands = glob.glob("sols_FR/%s_seed*.json" % base)
+    if not cands:
+        return None
+    sols = []
+    for f in cands:
+        try:
+            d = json.load(open(f))
+            sols.append((d["objective"], d))
+        except Exception:
+            continue
+    if not sols:
+        return None
+    best = max(sols, key=lambda t: t[0])[1]
+    sol = Solution(inst)
+    for rt in best["routes"]:
+        sol.routes[rt["drone"]] = rt["nodes"][1:-1]
+        sol.touch(rt["drone"])
+    sol.finalize()
+    for k in range(inst.K):
+        if sol.re[k] > inst.E[k] + 1.0:
+            return None
+    return sol
+
+
 def run_one(task):
     path, seed, cfg, save_dir = task
     inst = load_instance(path)
     best, st = ALNS(cfg, seed).solve(inst)
+    warm = _load_fr_warmstart(inst, seed)
+    if warm is not None and warm.objective(cfg.eps) > best.objective(cfg.eps):
+        best = warm
+        st["warm_start_used"] = True
+    else:
+        st["warm_start_used"] = False
     cov, en = validate(inst, best)
     total_mines = sum(1 for u in inst.targets() if inst.is_mine[u])
     detected = sum(1 for u in inst.targets() if inst.is_mine[u] and best.visited[u])
