@@ -2,7 +2,7 @@
 
 This repository contains the code, instances, and results for the paper:
 
-> **Multi-Depot Drone Marine Routing with Flexible Depots and Discrete Speeds: An Exact Mixed-Integer Linear Programming Approach for Underwater Mine Counter-Measures**
+> **Multi-Depot Drone Marine Routing with Flexible Depots and Discrete Speeds: A High-Fidelity Mixed-Integer Linear Programming Formulation and a Dedicated Adaptive Large Neighborhood Search for Underwater Mine Counter-Measures**
 
 Submitted to *Journal of Heuristics*.
 
