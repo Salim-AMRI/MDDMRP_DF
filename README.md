@@ -38,6 +38,7 @@ Two solution methods are provided:
 .
 ├── code/                    # Python source code
 │   └── alns_v2.py          # ALNS solver (main file)
+│   └── Gurobi solver       # Gurobi solver (main file)
 ├── instances/               # Benchmark instances (JSON)
 ├── docs/                    # Additional documentation
 ├── README.md
